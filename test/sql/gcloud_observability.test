@@ -1,0 +1,151 @@
+# name: test/sql/gcloud_observability.test
+# description: test the gcloud_observability extension (offline: load, secret, registration, error paths)
+# group: [sql]
+
+# Before the extension is loaded the table function does not exist.
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project');
+----
+does not exist
+
+require gcloud_observability
+
+# The reader is registered.
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_gcloud_logs';
+----
+true
+
+# The custom secret type works with Application Default Credentials (no token, no key file).
+statement ok
+CREATE SECRET gcloud_adc (
+    TYPE gcloud,
+    PROJECT 'my-project'
+);
+
+query I
+SELECT type FROM duckdb_secrets() WHERE name = 'gcloud_adc';
+----
+gcloud
+
+# It also works with an explicit access token.
+statement ok
+CREATE SECRET gcloud_token (
+    TYPE gcloud,
+    PROJECT 'my-project',
+    TOKEN 'SECRET_TOKEN_VALUE'
+);
+
+# ...and with a service-account key file.
+statement ok
+CREATE SECRET gcloud_key (
+    TYPE gcloud,
+    PROJECT 'my-project',
+    CREDENTIALS '/path/to/service-account.json',
+    QUOTA_PROJECT 'billing-project'
+);
+
+# TOKEN is redacted, never shown in duckdb_secrets().
+query I
+SELECT secret_string NOT LIKE '%SECRET_TOKEN_VALUE%' FROM duckdb_secrets() WHERE name = 'gcloud_token';
+----
+true
+
+# CREDENTIALS is only a path, so it stays visible: knowing which key file is in use leaks nothing.
+query I
+SELECT secret_string LIKE '%/path/to/service-account.json%' FROM duckdb_secrets() WHERE name = 'gcloud_key';
+----
+true
+
+# Referencing a secret that does not exist fails at bind time.
+statement error
+SELECT * FROM read_gcloud_logs(secret => 'no_such_secret', project => 'my-project');
+----
+No secret with name 'no_such_secret' found
+
+# Binding succeeds and exposes the OTLP-conformant schema. Every query below passes an explicit
+# `project`, so nothing here depends on whether the host has Application Default Credentials
+# configured; and binding never calls the network (the token is minted lazily, on the first scan).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_gcloud_logs(project => 'my-project'));
+----
+18
+
+# Key OTLP columns are present (order-independent).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_gcloud_logs(project => 'my-project'))
+WHERE column_name IN ('time_unix_nano', 'observed_time_unix_nano', 'trace_id', 'span_id', 'severity_number',
+                      'severity_text', 'body', 'resource_attributes', 'log_attributes', 'flags');
+----
+10
+
+# A secret supplies the project when the parameter is omitted.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_gcloud_logs(secret => 'gcloud_adc'));
+----
+18
+
+# `resource_names` addresses non-project parents (folders, organizations, log views).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_gcloud_logs(resource_names => ['folders/123', 'projects/p']));
+----
+18
+
+# Named parameters are validated at bind time (no network call is needed to hit these errors).
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project', max_rows => -1);
+----
+max_rows must be >= 0
+
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project', retries => -1);
+----
+retries must be >= 0
+
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project', timeout => 0);
+----
+timeout must be >= 1
+
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project', page_size => 0);
+----
+page_size must be between 1 and 1000
+
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project', page_size => 1001);
+----
+page_size must be between 1 and 1000
+
+# entries.list accepts only these two orderings; anything else is rejected rather than silently
+# sorted the wrong way.
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project', order_by => 'severity desc');
+----
+order_by must be 'timestamp desc' or 'timestamp asc'
+
+statement ok
+SELECT * FROM (DESCRIBE SELECT * FROM read_gcloud_logs(project => 'my-project', order_by => 'timestamp asc'));
+
+# Time bounds accept relative offsets and RFC 3339 instants, and reject anything else.
+statement ok
+SELECT * FROM (DESCRIBE SELECT * FROM read_gcloud_logs(project => 'my-project', start_time => '-15m', end_time => 'now'));
+
+statement ok
+SELECT * FROM (DESCRIBE SELECT * FROM read_gcloud_logs(project => 'my-project', start_time => '2026-07-09T00:00:00Z'));
+
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project', start_time => '-15x');
+----
+not a valid relative offset
+
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project', end_time => 'yesterday');
+----
+neither a relative offset
+
+# Unknown named parameters are rejected.
+statement error
+SELECT * FROM read_gcloud_logs(project => 'my-project', bogus_param => 10);
+----
+Invalid named parameter

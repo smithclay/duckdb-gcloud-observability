@@ -1,0 +1,61 @@
+#pragma once
+
+#include "duckdb.hpp"
+#include "gcloud_auth.hpp"
+
+//! Forward-declared so the (large) httplib header stays out of this public header. The namespace
+//! name matches cpp-httplib's OpenSSL build, which CMake selects globally via CPPHTTPLIB_OPENSSL_SUPPORT.
+namespace duckdb_httplib_openssl {
+class Client;
+}
+
+namespace duckdb {
+class ClientContext;
+
+//! Minimal client for the Cloud Logging API (POST /v2/entries:list). It knows how to authenticate
+//! (OAuth2 bearer token, obtained per gcloud_auth.hpp) and POST a JSON body; parsing the response
+//! and mapping LogEntry to OTLP lives in the table function. A single keep-alive connection is
+//! reused across pages.
+struct GcloudClient {
+	//! API base, e.g. "https://logging.googleapis.com". Requests go to <endpoint>/v2/entries:list.
+	string endpoint = "https://logging.googleapis.com";
+	//! How to obtain the bearer token for each request.
+	GcloudAuthConfig auth;
+	//! Skip TLS certificate/hostname verification (test doubles only).
+	bool insecure_tls = false;
+	//! Per-request connection/read timeout.
+	uint64_t timeout_seconds = 60;
+	//! Retry budget for transient failures: HTTP 429, HTTP 5xx, and transport errors (connection
+	//! reset, timeout) share this budget with exponential backoff. 0 disables retrying.
+	//! Non-transient failures (4xx other than 429, TLS certificate verification) are never retried.
+	//! A 401 is retried exactly once, after dropping the cached token — see ListEntries.
+	uint64_t retries = 4;
+
+	// Owns a live keep-alive connection (the unique_ptr below), so the type is non-copyable. It is
+	// only ever default-constructed in place inside the table function's bind data. The constructor
+	// and destructor are declared here and defined out-of-line so the unique_ptr may hold a
+	// forward-declared (incomplete) Client; both must live where Client is complete.
+	GcloudClient();
+	~GcloudClient();
+
+	//! POST `json_body` to /v2/entries:list and return the raw JSON response body. Transparently
+	//! retries transient failures (429 / 5xx / transport errors) up to `retries` times, sleeping in
+	//! small slices so query interrupts (Ctrl+C) cancel the wait promptly. Throws IOException when
+	//! retries are exhausted or the failure is not transient, and InterruptException if the query
+	//! was cancelled.
+	string ListEntries(ClientContext &context, const string &json_body) const;
+
+private:
+	//! Lazily created on first use and reused (HTTP keep-alive). Mutable because ListEntries is
+	//! const — it runs against the const bind data shared by all scans — yet must cache the socket.
+	//! Reset (and re-established) after a transport error, since the failure may have left the
+	//! pooled socket broken.
+	mutable unique_ptr<duckdb_httplib_openssl::Client> connection;
+
+	//! Return the shared connection, creating and configuring it (TLS, timeouts) on the first call.
+	//! Authorization is *not* set here: the token can be refreshed between requests, so it is
+	//! attached per-request instead.
+	duckdb_httplib_openssl::Client &GetConnection() const;
+};
+
+} // namespace duckdb
