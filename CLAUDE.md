@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A DuckDB extension (`read_gcloud_logs` table function + `gcloud` secret type) that queries logs from
-the Google Cloud Logging API (`entries.list`) and returns rows in the flat 18-column `duckdb-otlp`
-`read_otlp_logs` schema. It was ported from the sibling reference extensions at
+A DuckDB extension (`read_gcloud_logs` table function, an `ATTACH 'gcloud:'` read-only catalog, and
+the `gcloud` secret type) that queries logs from the Google Cloud Logging API (`entries.list`) and
+returns rows in the flat 18-column `duckdb-otlp` `read_otlp_logs` schema, plus two Cloud Monitoring
+alert tables. It was ported from the sibling reference extensions at
 `~/workspace/duckdb-splunk` and `~/workspace/duckdb-datadog` — when a pattern here is unclear, those
 repos are the canonical templates for extension structure, the secret pattern, retry/backoff, RAII
 yyjson helpers, and projection pushdown.
@@ -72,9 +73,10 @@ User credentials also need a quota project: without `x-goog-user-project`, `entr
 
 ## Architecture
 
-Five source files under `src/` (+ headers in `src/include/`):
+Source files under `src/` (+ headers in `src/include/`):
 
-- `gcloud_observability_extension.cpp` — entry point; registers the secret type and the table function.
+- `gcloud_observability_extension.cpp` — entry point; registers the secret type, the catalog, and the
+  table function.
 - `gcloud_secret.cpp` — the `gcloud` KeyValueSecret (`PROJECT`, `TOKEN`, `CREDENTIALS`,
   `QUOTA_PROJECT`, `UNIVERSE_DOMAIN`, `ENDPOINT`, `INSECURE_TLS`). `TOKEN` is redacted;
   `CREDENTIALS` is only a path, so it stays visible.
@@ -82,7 +84,21 @@ Five source files under `src/` (+ headers in `src/include/`):
 - `gcloud_client.cpp` — `GcloudClient`: one keep-alive httplib connection, `POST /v2/entries:list`,
   and the retry loop (429/5xx/transport, exponential backoff, ~100ms-granular cancellation via
   `context.interrupted`).
-- `logs_table.cpp` — the bulk. Request building, response parsing, and the LogEntry→OTLP mapping.
+- `logs_table.cpp` — the bulk. The LogEntry→OTLP mapping, the scan/pagination loop, and the
+  conservative WHERE pushdown.
+- `gcloud_json.cpp` — *pure* request building and response parsing (no network, no catalog, no
+  planner). This is what `test/cpp/gcloud_json_test.cpp` covers offline; keep it dependency-free so
+  that stays true. `make test` runs it alongside the SQL tests.
+- `gcloud_yyjson.hpp` — header-only yyjson RAII owners and typed accessors shared by the three
+  readers. Names are `Gcloud`-prefixed because they are no longer file-local statics.
+- `alerts_table.cpp` — the two Cloud Monitoring tables (`alerts.open`, `alerts.policies`). Both share
+  one scan/pagination path and differ only in the request path and the row mapper.
+- `gcloud_catalog.cpp` — the `ATTACH 'gcloud:'` storage extension: schemas `logs` (one table,
+  `entries`) and `alerts`. Read-only; every mutating catalog entry point throws.
+
+Two DuckDB API gotchas the catalog hit, both worked around with a by-value delegating constructor:
+`TableCatalogEntry` takes `CreateTableInfo &` and `SchemaCatalogEntry` takes `CreateSchemaInfo &`,
+neither of which a temporary can bind to.
 
 ### Auth is the part that differs most from the siblings
 
@@ -150,6 +166,53 @@ token that this extension must mint itself**, mirroring what the OpenTelemetry C
   quotes or backslashes cannot corrupt the request.
 - `filter` is parenthesized before `start_time`/`end_time` are ANDed on, so a top-level `OR` inside a
   user filter cannot swallow the time bound.
+
+### Filter pushdown
+
+`pushdown_complex_filter` translates a small subset of the WHERE clause into Logging query-language
+terms. The invariant is that a pushed term must match a **superset** of the SQL match: DuckDB keeps
+the original predicate above the scan, so too-broad only costs bandwidth while too-narrow silently
+drops rows.
+
+- Pushed: `time_unix_nano` comparisons (rounded *outward* to whole seconds) and `severity_text`
+  equality / `IN`, both of which map to a LogEntry field verbatim.
+- **`BETWEEN` must be handled explicitly.** The optimizer folds `ts >= a AND ts <= b` into one
+  `BoundBetweenExpression` before the callback runs, so handling only `BOUND_COMPARISON` misses the
+  most common way a time window is written. This was a real bug caught by EXPLAIN, not a hypothetical.
+- **`service_name` is deliberately not pushed**, unlike `duckdb-datadog`'s `service:` term. There the
+  column is one API field; here it falls back across `resource.labels.service_name`, several
+  `jsonPayload` keys, `labels`, and `resource.labels.{function_name,container_name,job}`, so any
+  single term would match strictly fewer rows and drop GKE/Cloud Functions results. `trace_id` is
+  excluded for the same reason.
+- **Pushdown is disabled entirely when `max_rows > 0`.** The cap applies to rows as they arrive from
+  the API, before the SQL WHERE runs, so narrowing the request changes which rows compete for the
+  budget. Matches `duckdb-datadog`.
+- Contradictory constant bounds never reach the extension — DuckDB folds them to `EMPTY_RESULT` first
+  — so `GcloudFilterPushdown::empty_result` is defensive, not load-bearing.
+
+Testing pushdown: use `EXPLAIN (FORMAT JSON)`, never plain `EXPLAIN` (the box renderer wraps long
+filters across lines) and never `EXPLAIN` in a subquery (a parser error). DuckDB's sqllogictest
+matcher is **RE2 with `FullMatch`**, so there is no lookahead — use the built-in `<!REGEX>:` for
+negative assertions. Note `\"` in the JSON needs `..` in the pattern, not `.`.
+
+### WASM
+
+The browser build is `TOKEN`-only: OpenSSL here is both the TLS backend *and* the RS256 signer for
+the service-account JWT, and there is no filesystem for ADC discovery, so both native credential
+paths compile out. `#ifdef __EMSCRIPTEN__` branches live in `gcloud_client.cpp` (HTTPUtil/`fetch()`
+instead of httplib) and `gcloud_auth.cpp` (the whole file splits at the top-level `#ifndef`).
+
+`GcloudClient::endpoint` may carry a **path prefix**, preserved ahead of the request path — that is
+the seam a CORS proxy route plugs into. `SplitGcloudEndpoint` lives in `gcloud_json.cpp` (not the
+client) so the offline C++ test can cover it without httplib.
+
+`emcc` is not installed on this machine. To check the browser branches without it, syntax-check with
+the macro forced on, taking flags from `build/release/compile_commands.json` minus
+`CPPHTTPLIB_OPENSSL_SUPPORT`:
+
+```bash
+/usr/bin/c++ <flags> -D__EMSCRIPTEN__ -fsyntax-only src/gcloud_client.cpp
+```
 
 ### Bind-time vs scan-time
 
