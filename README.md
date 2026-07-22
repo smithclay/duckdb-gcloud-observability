@@ -237,6 +237,55 @@ GROUP BY 1;
 Because `body` is a single string, a structured `jsonPayload` is *also* merged field-by-field into
 `log_attributes`, so its fields stay individually queryable without re-parsing `body`.
 
+## DuckDB-WASM (browser)
+
+The extension builds for WASM (`make wasm_mvp` / `wasm_eh` / `wasm_threads`, using
+`extension_config_wasm.cmake`). Two things differ from a native build, and both are hard
+constraints rather than choices.
+
+**Authentication is `TOKEN`-only.** A browser has no filesystem to discover Application Default
+Credentials on and no OpenSSL to sign a service-account assertion with — and here OpenSSL is not
+just the TLS backend, it is the RS256 signer. That removes both of the native credential paths and
+leaves the one that needs neither:
+
+```sql
+CREATE SECRET (TYPE gcloud, PROJECT 'my-project', TOKEN '<gcloud auth print-access-token>');
+```
+
+Google access tokens expire after about an hour, so a browser session should refresh the secret
+rather than hold one indefinitely; expiry surfaces as HTTP 401. (This is a sharper constraint than
+the sibling `duckdb-datadog` / `duckdb-splunk` extensions face: their credential is a static API key,
+so their auth works in a browser unchanged.)
+
+**Requests must go through a CORS proxy.** Google's APIs send no `Access-Control-Allow-Origin`, so a
+page cannot call them directly. Point the endpoints at your proxy's routes:
+
+```sql
+CREATE SECRET (TYPE gcloud,
+    PROJECT             'my-project',
+    TOKEN               '<access token>',
+    ENDPOINT            'https://your-proxy.example.com/api/gcloud/logging',
+    MONITORING_ENDPOINT 'https://your-proxy.example.com/api/gcloud/monitoring');
+```
+
+An endpoint may carry a path prefix, which is preserved ahead of the request path — so the route
+above becomes `POST /api/gcloud/logging/v2/entries:list`. The proxy needs to:
+
+- forward `/api/gcloud/logging/*` to `https://logging.googleapis.com/*` (POST) and
+  `/api/gcloud/monitoring/*` to `https://monitoring.googleapis.com/*` (GET), query string included;
+- allow the **`Authorization`** and **`x-goog-user-project`** request headers in
+  `Access-Control-Allow-Headers` — without the latter, end-user credentials fail with
+  `USER_PROJECT_DENIED`;
+- answer `OPTIONS` preflight, and allow both `GET` and `POST`.
+
+`~/workspace/duckdb-tero`'s `wasm-query-lab/worker/` is a working Cloudflare Worker of exactly this
+shape (it proxies Tero and Datadog); adding two `gcloud` routes to it is the quickest path to a
+browser demo.
+
+Retry and TLS are the browser's job in this build: DuckDB-WASM's `HTTPUtil` issues the request
+through `fetch()`, so the native retry loop, keep-alive connection, and 401 re-mint are compiled
+out (there is nothing to re-mint — the token is static).
+
 ## Building
 
 Requires the submodules and OpenSSL:

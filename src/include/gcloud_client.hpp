@@ -3,11 +3,14 @@
 #include "duckdb.hpp"
 #include "gcloud_auth.hpp"
 
+#ifndef __EMSCRIPTEN__
 //! Forward-declared so the (large) httplib header stays out of this public header. The namespace
 //! name matches cpp-httplib's OpenSSL build, which CMake selects globally via CPPHTTPLIB_OPENSSL_SUPPORT.
+//! Browser builds use DuckDB's own HTTPUtil instead and have no native socket layer at all.
 namespace duckdb_httplib_openssl {
 class Client;
 }
+#endif
 
 namespace duckdb {
 class ClientContext;
@@ -17,7 +20,9 @@ class ClientContext;
 //! and mapping LogEntry to OTLP lives in the table function. A single keep-alive connection is
 //! reused across pages.
 struct GcloudClient {
-	//! API base, e.g. "https://logging.googleapis.com". Requests go to <endpoint>/v2/entries:list.
+	//! API base, e.g. "https://logging.googleapis.com". Requests go to <endpoint><path>. It may carry
+	//! a path prefix ("https://lab.example.com/api/gcloud/logging"), which is how a browser build is
+	//! pointed at a CORS proxy; the prefix is preserved ahead of the request path.
 	string endpoint = "https://logging.googleapis.com";
 	//! How to obtain the bearer token for each request.
 	GcloudAuthConfig auth;
@@ -55,6 +60,7 @@ struct GcloudClient {
 	string Get(ClientContext &context, const string &path, const char *api_name) const;
 
 private:
+#ifndef __EMSCRIPTEN__
 	//! Lazily created on first use and reused (HTTP keep-alive). Mutable because ListEntries is
 	//! const — it runs against the const bind data shared by all scans — yet must cache the socket.
 	//! Reset (and re-established) after a transport error, since the failure may have left the
@@ -65,6 +71,7 @@ private:
 	//! Authorization is *not* set here: the token can be refreshed between requests, so it is
 	//! attached per-request instead.
 	duckdb_httplib_openssl::Client &GetConnection() const;
+#endif
 };
 
 } // namespace duckdb

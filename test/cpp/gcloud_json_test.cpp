@@ -64,6 +64,23 @@ int main() {
 		        "multiple pushed severities should become a parenthesized OR so the AND-chain is not broken");
 
 		//===------------------------------------------------------------===//
+		// Endpoint splitting (the CORS-proxy seam for browser builds)
+		//===------------------------------------------------------------===//
+		string origin, prefix;
+		SplitGcloudEndpoint("https://logging.googleapis.com", origin, prefix);
+		Require(origin == "https://logging.googleapis.com" && prefix.empty(),
+		        "a bare API host should yield no path prefix");
+		SplitGcloudEndpoint("https://logging.googleapis.com/", origin, prefix);
+		Require(origin == "https://logging.googleapis.com" && prefix.empty(),
+		        "a trailing slash is not a path prefix");
+		SplitGcloudEndpoint("https://lab.example.com/api/gcloud/logging", origin, prefix);
+		Require(origin == "https://lab.example.com" && prefix == "/api/gcloud/logging",
+		        "a proxy route should split into origin and prefix so request paths append to it");
+		SplitGcloudEndpoint("http://localhost:8080/proxy", origin, prefix);
+		Require(origin == "http://localhost:8080" && prefix == "/proxy",
+		        "an explicit port must stay with the origin, not start the path");
+
+		//===------------------------------------------------------------===//
 		// entries.list request body
 		//===------------------------------------------------------------===//
 		auto body = BuildGcloudListBody({"projects/p"}, "severity = \"ERROR\"", "timestamp desc", 500, "");

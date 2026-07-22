@@ -63,6 +63,16 @@ string ApplyGcloudPushdown(const string &filter, const GcloudFilterPushdown &pus
 string BuildGcloudFilter(const string &filter, const string &start_time, const string &end_time);
 
 //===--------------------------------------------------------------------===//
+// Endpoints
+//===--------------------------------------------------------------------===//
+
+//! Split a base URL into the scheme+host[:port] origin (what httplib's Client takes) and any path
+//! prefix, which must be prepended to each request path. A base with no path yields "", and a bare
+//! trailing '/' is not treated as a prefix. The prefix is what lets a browser build aim the client
+//! at a CORS proxy route ("https://lab.example.com/api/gcloud/logging") instead of Google directly.
+void SplitGcloudEndpoint(const string &endpoint, string &origin, string &path_prefix);
+
+//===--------------------------------------------------------------------===//
 // entries.list
 //===--------------------------------------------------------------------===//
 

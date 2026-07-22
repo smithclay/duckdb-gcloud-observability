@@ -4,25 +4,32 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 
+#include "yyjson.hpp"
+
+#include <chrono>
+#include <cstdlib>
+#include <memory>
+
+// Everything below is native-only. A browser build has no OpenSSL to sign an RS256 assertion with
+// and no filesystem to discover Application Default Credentials on, so it supports exactly one
+// credential: a pre-minted TOKEN. See the __EMSCRIPTEN__ branch at the bottom of this file.
+#ifndef __EMSCRIPTEN__
 // DuckDB's bundled cpp-httplib. CPPHTTPLIB_OPENSSL_SUPPORT (see CMakeLists) both enables TLS and
 // selects the `duckdb_httplib_openssl` namespace, so these symbols never collide with core DuckDB's
 // non-SSL `duckdb_httplib` build.
 #include "httplib.hpp"
-#include "yyjson.hpp"
 
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 
-#include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <memory>
 #include <mutex>
 #include <sstream>
 #include <sys/stat.h>
 #include <unordered_map>
+#endif
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -34,6 +41,8 @@ const char *const kMonitoringReadScope = "https://www.googleapis.com/auth/monito
 //! Google's public OAuth2 token endpoint. Credentials files normally carry their own `token_uri`;
 //! this is the fallback when they do not.
 static constexpr const char *kDefaultTokenUri = "https://oauth2.googleapis.com/token";
+
+#ifndef __EMSCRIPTEN__
 
 //===--------------------------------------------------------------------===//
 // Small RAII helpers — free on every path, including exceptions
@@ -498,5 +507,51 @@ GcloudAccessToken GetGcloudAccessToken(ClientContext &context, const GcloudAuthC
 	}
 	return GcloudAccessToken {token, quota_project};
 }
+
+#else // __EMSCRIPTEN__
+
+//===--------------------------------------------------------------------===//
+// Browser build: TOKEN only
+//===--------------------------------------------------------------------===//
+//
+// DuckDB-WASM runs with no filesystem and no OpenSSL, which removes both credential paths the
+// native build supports: Application Default Credentials are discovered by reading
+// ~/.config/gcloud, and a service-account key is exchanged by signing an RS256 JWT assertion. What
+// is left is the escape hatch that needs neither -- a token the caller minted elsewhere and passed
+// in. Note this is a much sharper constraint than the sibling datadog/splunk extensions face: their
+// credential is a static API key, so their auth works unchanged in a browser.
+//
+// A Google access token is short-lived (~1h), so a browser session is expected to refresh the
+// secret rather than hold one indefinitely.
+
+string DiscoverAdcPath() {
+	return string(); // No filesystem to discover credentials on.
+}
+
+string TryDiscoverAdcProject() {
+	return string(); // Same: the project must be given explicitly in a browser.
+}
+
+void InvalidateGcloudTokenCache(const GcloudAuthConfig &) {
+	// Nothing is cached: a static token is used verbatim and never minted.
+}
+
+GcloudAccessToken GetGcloudAccessToken(ClientContext &context, const GcloudAuthConfig &config) {
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+	if (config.HasStaticToken()) {
+		return GcloudAccessToken {config.token, config.quota_project};
+	}
+	throw InvalidInputException(
+	    "This is a DuckDB-WASM build, which can only authenticate with a pre-minted access token: it has no "
+	    "filesystem to read Application Default Credentials from and no OpenSSL to sign a service-account "
+	    "assertion with. Supply a token explicitly:\n"
+	    "  CREATE SECRET (TYPE gcloud, PROJECT 'my-project', TOKEN '<gcloud auth print-access-token>');\n"
+	    "Google access tokens expire after about an hour, so refresh the secret when queries start failing "
+	    "with HTTP 401.");
+}
+
+#endif // __EMSCRIPTEN__
 
 } // namespace duckdb

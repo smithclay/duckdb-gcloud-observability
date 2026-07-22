@@ -167,6 +167,27 @@ string ApplyGcloudPushdown(const string &filter, const GcloudFilterPushdown &pus
 }
 
 //===--------------------------------------------------------------------===//
+// Endpoints
+//===--------------------------------------------------------------------===//
+
+void SplitGcloudEndpoint(const string &endpoint, string &origin, string &path_prefix) {
+	auto scheme_end = endpoint.find("://");
+	auto host_start = (scheme_end == string::npos) ? 0 : scheme_end + 3;
+	auto path_start = endpoint.find('/', host_start);
+	if (path_start == string::npos) {
+		origin = endpoint;
+		path_prefix = string();
+		return;
+	}
+	origin = endpoint.substr(0, path_start);
+	path_prefix = endpoint.substr(path_start);
+	// A bare trailing '/' is not a prefix; keeping it would double the separator in every path.
+	while (!path_prefix.empty() && path_prefix.back() == '/') {
+		path_prefix.pop_back();
+	}
+}
+
+//===--------------------------------------------------------------------===//
 // entries.list
 //===--------------------------------------------------------------------===//
 
