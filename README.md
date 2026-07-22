@@ -72,8 +72,12 @@ CREATE SECRET (TYPE gcloud, PROJECT 'my-project', TOKEN '<access token>');
 | `CREDENTIALS`     | ADC discovery      | Path to a service-account key or authorized-user JSON |
 | `QUOTA_PROJECT`   | file's `quota_project_id` | Sent as `x-goog-user-project` |
 | `UNIVERSE_DOMAIN` | `googleapis.com`   | Sovereign Cloud / non-standard universes |
-| `ENDPOINT`        | derived            | Full API base override, e.g. `https://logging.googleapis.com` |
+| `ENDPOINT`        | derived            | Cloud Logging API base override, e.g. `https://logging.googleapis.com` |
+| `MONITORING_ENDPOINT` | derived        | Cloud Monitoring API base override (the alert tables) |
 | `INSECURE_TLS`    | `false`            | Skip TLS verification (test doubles only) |
+
+`ENDPOINT` and `MONITORING_ENDPOINT` are separate because the two APIs live on different hosts, so
+one override cannot stand in for both.
 
 ## `read_gcloud_logs` parameters
 
@@ -93,6 +97,92 @@ CREATE SECRET (TYPE gcloud, PROJECT 'my-project', TOKEN '<access token>');
 
 Bad parameters, a missing secret, and an unresolvable project all fail at **bind** time, before any
 network call. The first scan mints the token and pages through the results.
+
+## Filter pushdown
+
+A small, conservative subset of the SQL `WHERE` clause is translated into the Logging query language
+and sent with the request, so the API returns less data. DuckDB still evaluates the original `WHERE`
+above the scan, so results are always exactly what the SQL says.
+
+| SQL predicate | Sent to Cloud Logging |
+|---|---|
+| `time_unix_nano >= / > / <= / < / = <ts>` | `timestamp >= "..."` / `timestamp <= "..."`, rounded **outward** to whole seconds |
+| `time_unix_nano BETWEEN a AND b` | both bounds (the optimizer folds `>=`/`<=` into a BETWEEN before pushdown runs) |
+| `severity_text = 'ERROR'` | `severity = "ERROR"` |
+| `severity_text IN ('ERROR','CRITICAL')` | `(severity = "ERROR" OR severity = "CRITICAL")` |
+
+Only predicates whose translation matches a **superset** of the SQL match are pushed. A term that is
+too broad merely costs bandwidth; one that is too narrow would silently drop rows.
+
+Deliberately **not** pushed:
+
+- **`service_name`** — unlike the sibling `duckdb-datadog`, where the column maps to one API field,
+  here it is derived by falling back across `resource.labels.service_name`, several `jsonPayload`
+  keys, `labels`, and `resource.labels.{function_name,container_name,job}`. Any single filter term
+  would match strictly fewer rows and drop legitimate GKE / Cloud Functions results.
+- **`trace_id`** — the mapping accepts both `projects/P/traces/ID` and a bare id.
+- **`OR` branches** — pushing one branch alone would drop rows matching only the other. Only the
+  conjuncts of a top-level `AND` are considered.
+- **anything, when `max_rows > 0`** — the cap applies to rows as they arrive from the API, before the
+  SQL `WHERE` runs. Narrowing the request would change which rows compete for that budget, so
+  `max_rows => 1 WHERE severity_text = 'ERROR'` would mean something different with pushdown than
+  without. Matches `duckdb-datadog`.
+
+`EXPLAIN` shows exactly what was pushed:
+
+```sql
+EXPLAIN SELECT body FROM read_gcloud_logs(project => 'my-project')
+WHERE severity_text = 'ERROR'
+  AND time_unix_nano >= TIMESTAMP_NS '2026-07-20 10:00:00';
+--   Google Cloud Filter: timestamp >= "2026-07-20T10:00:00Z" AND severity = "ERROR"
+```
+
+## Catalog (`ATTACH`)
+
+`ATTACH 'gcloud:'` exposes the project as a read-only database, so log entries and Cloud Monitoring
+alerts are ordinary tables that joins, views, and BI tools can reach without naming a table function.
+
+```sql
+ATTACH 'gcloud:' AS gcp (TYPE gcloud, PROJECT 'my-project', START_TIME '-1h', MAX_ROWS 1000);
+
+SELECT severity_text, count(*) FROM gcp.logs.entries GROUP BY 1 ORDER BY 2 DESC;
+
+SELECT policy_name, summary, opened_at FROM gcp.alerts.open ORDER BY opened_at DESC;
+```
+
+| Table | Source | Notes |
+|---|---|---|
+| `logs.entries` | `entries.list` | The same 18 columns as `read_gcloud_logs`, and the same pushdown |
+| `alerts.open` | `GET /v3/projects/{p}/alerts?filter=state=open` | Currently-open incidents. **Public Preview API** — see below |
+| `alerts.policies` | `projects.alertPolicies.list` | Alerting policy configuration (GA) |
+
+ATTACH options: `SECRET`, `PROJECT`, `FILTER`, `START_TIME`, `END_TIME`, `ORDER_BY`, `PAGE_SIZE`,
+`MAX_ROWS`, `RETRIES`, `TIMEOUT`. They are validated by the same code as the table function's
+parameters, so the two interfaces cannot drift. The log settings apply to `logs.entries`;
+`MAX_ROWS`, `RETRIES`, and `TIMEOUT` also apply to the alert tables.
+
+The secret is resolved at attach time (so a bad name fails immediately) but only its *name* is
+retained, so a later `CREATE OR REPLACE SECRET` is picked up on the next query.
+
+### A note on the alerts APIs
+
+The two alert tables sit on different stability tiers, and that is worth knowing before you build on
+them:
+
+- **`alerts.policies`** reads [`projects.alertPolicies.list`][policies], which is GA and in the v3
+  REST reference.
+- **`alerts.open`** reads `GET https://monitoring.googleapis.com/v3/projects/{project}/alerts`, which
+  is **Public Preview** (subject to the Pre-GA Offerings Terms). It is documented in the [Cloud
+  Logging alerting guide][incidents] rather than the v3 REST reference, and is what
+  `gcloud alpha monitoring alerts list` calls. There is no GA API for listing open incidents. The
+  reader accepts both the `openTime` and `open_time` spellings, since Google's docs and its proto3
+  JSON output disagree on which one this endpoint emits.
+
+Both tables need the `monitoring.read` scope, which is requested separately from `logging.read`, so
+a logs-only query never asks for monitoring authority.
+
+[policies]: https://cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.alertPolicies/list
+[incidents]: https://cloud.google.com/logging/docs/alerting/log-based-incidents
 
 ## Mapping to OTLP
 

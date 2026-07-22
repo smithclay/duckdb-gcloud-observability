@@ -9,6 +9,11 @@ class ClientContext;
 //! googlecloudmonitoringreceiver, which calls google.FindDefaultCredentials(ctx, <read scope>).
 extern const char *const kLoggingReadScope;
 
+//! OAuth2 scope for the Cloud Monitoring read path, used by the alerts tables. Requested separately
+//! from the logging scope so a logs-only query never asks for monitoring authority (and vice
+//! versa); the token cache is keyed by scope, so the two coexist.
+extern const char *const kMonitoringReadScope;
+
 //! How to obtain an OAuth2 bearer token for the Cloud Logging API. Exactly one of `token` (an
 //! already-minted access token) or a credentials JSON file is used; when both are empty the file is
 //! discovered the way every Google client library does it (Application Default Credentials).
@@ -23,6 +28,10 @@ struct GcloudAuthConfig {
 	//! end-user (authorized_user) credentials. Empty => taken from the credentials file's
 	//! `quota_project_id`, if present.
 	string quota_project;
+	//! OAuth2 scope requested when minting a token. Only the `service_account` path sends it: the
+	//! refresh-token grant deliberately sends no scope, because it returns whatever was originally
+	//! consented to (typically cloud-platform, which covers both APIs).
+	string scope = kLoggingReadScope;
 	//! Skip TLS verification when talking to the OAuth2 token endpoint. Test doubles only.
 	bool insecure_tls = false;
 	//! Per-request connection/read timeout for the token exchange.

@@ -7,6 +7,7 @@
 #include "yyjson.hpp"
 
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <thread>
 
@@ -117,11 +118,13 @@ static string DescribeApiError(const string &body) {
 	return described;
 }
 
-string GcloudClient::ListEntries(ClientContext &context, const string &json_body) const {
+string GcloudClient::Request(ClientContext &context, const char *method, const string &path, const string &json_body,
+                             const char *api_name) const {
 	// A 401 means the token was rejected (expired, or revoked mid-query). Drop the cached token and
 	// re-mint exactly once: a second 401 is a real authorization problem, not a stale token, and
 	// retrying it would loop.
 	bool token_refreshed = false;
+	bool is_post = strcmp(method, "POST") == 0;
 
 	for (uint64_t attempt = 0;; attempt++) {
 		if (context.interrupted) {
@@ -139,7 +142,8 @@ string GcloudClient::ListEntries(ClientContext &context, const string &json_body
 			headers.emplace("x-goog-user-project", access_token.quota_project);
 		}
 
-		auto response = GetConnection().Post(kEntriesListPath, headers, json_body, "application/json");
+		auto response = is_post ? GetConnection().Post(path.c_str(), headers, json_body, "application/json")
+		                        : GetConnection().Get(path.c_str(), headers);
 
 		if (!response) {
 			auto error = response.error();
@@ -147,7 +151,7 @@ string GcloudClient::ListEntries(ClientContext &context, const string &json_body
 			// reconnecting from scratch is the reliable way to retry.
 			connection.reset();
 			if (attempt >= retries || !IsRetryableTransportError(error)) {
-				throw IOException("Cloud Logging API request to %s failed: %s", endpoint,
+				throw IOException("%s API request to %s failed: %s", api_name, endpoint,
 				                  duckdb_httplib_openssl::to_string(error));
 			}
 			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
@@ -173,11 +177,19 @@ string GcloudClient::ListEntries(ClientContext &context, const string &json_body
 		if (response->status < 200 || response->status >= 300) {
 			// The body carries Google's error message but never the bearer token, which travels only
 			// in the request's Authorization header.
-			throw IOException("Cloud Logging API returned HTTP %d: %s", response->status,
+			throw IOException("%s API returned HTTP %d: %s", api_name, response->status,
 			                  DescribeApiError(response->body));
 		}
 		return response->body;
 	}
+}
+
+string GcloudClient::ListEntries(ClientContext &context, const string &json_body) const {
+	return Request(context, "POST", kEntriesListPath, json_body, "Cloud Logging");
+}
+
+string GcloudClient::Get(ClientContext &context, const string &path, const char *api_name) const {
+	return Request(context, "GET", path, string(), api_name);
 }
 
 } // namespace duckdb

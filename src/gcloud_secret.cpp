@@ -42,6 +42,7 @@ void RegisterGcloudSecretType(ExtensionLoader &loader) {
 	gcloud_secret_function.named_parameters["quota_project"] = LogicalType::VARCHAR;
 	gcloud_secret_function.named_parameters["universe_domain"] = LogicalType::VARCHAR;
 	gcloud_secret_function.named_parameters["endpoint"] = LogicalType::VARCHAR;
+	gcloud_secret_function.named_parameters["monitoring_endpoint"] = LogicalType::VARCHAR;
 	gcloud_secret_function.named_parameters["insecure_tls"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(gcloud_secret_function);
 }
@@ -106,6 +107,7 @@ GcloudCredentials GetGcloudCredentials(ClientContext &context, const string &sec
 	ReadStringKey(*kv_secret, "quota_project", credentials.quota_project);
 	ReadStringKey(*kv_secret, "universe_domain", credentials.universe_domain);
 	ReadStringKey(*kv_secret, "endpoint", credentials.endpoint);
+	ReadStringKey(*kv_secret, "monitoring_endpoint", credentials.monitoring_endpoint);
 
 	Value value;
 	if (kv_secret->TryGetValue("insecure_tls", value) && !value.IsNull()) {
@@ -114,15 +116,14 @@ GcloudCredentials GetGcloudCredentials(ClientContext &context, const string &sec
 	return credentials;
 }
 
-string GcloudLoggingEndpoint(const GcloudCredentials &credentials) {
-	string base =
-	    credentials.endpoint.empty() ? "https://logging." + credentials.universe_domain : credentials.endpoint;
+//! Normalize an API base: trim, drop trailing '/', and assume HTTPS for a bare host.
+static string NormalizeEndpoint(string base, const char *fallback) {
 	StringUtil::Trim(base);
 	while (!base.empty() && base.back() == '/') {
 		base.pop_back();
 	}
 	if (base.empty()) {
-		return "https://logging.googleapis.com";
+		return string(fallback);
 	}
 	// A bare host ("logging.googleapis.com", "localhost:8080") is accepted and assumed HTTPS, so a
 	// user need not repeat the scheme; httplib requires scheme+host+port with no path.
@@ -130,6 +131,22 @@ string GcloudLoggingEndpoint(const GcloudCredentials &credentials) {
 		base = "https://" + base;
 	}
 	return base;
+}
+
+string GcloudLoggingEndpoint(const GcloudCredentials &credentials) {
+	return NormalizeEndpoint(credentials.endpoint.empty() ? "https://logging." + credentials.universe_domain
+	                                                      : credentials.endpoint,
+	                         "https://logging.googleapis.com");
+}
+
+string GcloudMonitoringEndpoint(const GcloudCredentials &credentials) {
+	// An explicit `endpoint` overrides the Logging host wholesale, so it cannot also name the
+	// Monitoring host; derive from the universe domain and let MONITORING_ENDPOINT override.
+	if (!credentials.monitoring_endpoint.empty()) {
+		return NormalizeEndpoint(credentials.monitoring_endpoint, "https://monitoring.googleapis.com");
+	}
+	return NormalizeEndpoint("https://monitoring." + credentials.universe_domain,
+	                         "https://monitoring.googleapis.com");
 }
 
 } // namespace duckdb

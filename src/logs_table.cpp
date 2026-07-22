@@ -854,6 +854,15 @@ static void GcloudLogsPushdownComplexFilter(ClientContext &, LogicalGet &get, Fu
                                             vector<unique_ptr<Expression>> &filters) {
 	auto &bind = bind_data->Cast<GcloudLogsBindData>();
 	bind.pushdown = GcloudFilterPushdown();
+	if (bind.max_rows > 0) {
+		// `max_rows` caps rows as they come back from the API, before the SQL WHERE is evaluated, so
+		// narrowing the request would change which rows compete for that budget:
+		// `max_rows => 1 WHERE severity_text = 'ERROR'` would return the newest ERROR entry with
+		// pushdown but the newest entry (then filtered away) without it. Leaving the request
+		// unnarrowed keeps the cap's meaning fixed and independent of what the optimizer chose to
+		// push. Matches duckdb-datadog.
+		return;
+	}
 	for (const auto &filter : filters) {
 		TryPushExpression(get, *filter, bind.pushdown);
 	}

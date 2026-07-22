@@ -38,12 +38,21 @@ struct GcloudClient {
 	GcloudClient();
 	~GcloudClient();
 
-	//! POST `json_body` to /v2/entries:list and return the raw JSON response body. Transparently
-	//! retries transient failures (429 / 5xx / transport errors) up to `retries` times, sleeping in
-	//! small slices so query interrupts (Ctrl+C) cancel the wait promptly. Throws IOException when
-	//! retries are exhausted or the failure is not transient, and InterruptException if the query
-	//! was cancelled.
+	//! Issue one authenticated request against `endpoint` and return the raw response body.
+	//! `method` is "GET" or "POST"; `json_body` is ignored for GET. `api_name` names the API in error
+	//! messages ("Cloud Logging", "Cloud Monitoring"). Transparently retries transient failures
+	//! (429 / 5xx / transport errors) up to `retries` times, sleeping in small slices so query
+	//! interrupts (Ctrl+C) cancel the wait promptly, and re-mints the token once on a 401. Throws
+	//! IOException when retries are exhausted or the failure is not transient, and InterruptException
+	//! if the query was cancelled.
+	string Request(ClientContext &context, const char *method, const string &path, const string &json_body,
+	               const char *api_name) const;
+
+	//! POST `json_body` to /v2/entries:list. Convenience wrapper over Request.
 	string ListEntries(ClientContext &context, const string &json_body) const;
+
+	//! GET `path` (which must already carry any query string). Convenience wrapper over Request.
+	string Get(ClientContext &context, const string &path, const char *api_name) const;
 
 private:
 	//! Lazily created on first use and reused (HTTP keep-alive). Mutable because ListEntries is

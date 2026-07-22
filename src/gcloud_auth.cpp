@@ -29,6 +29,7 @@ using namespace duckdb_yyjson; // NOLINT
 namespace duckdb {
 
 const char *const kLoggingReadScope = "https://www.googleapis.com/auth/logging.read";
+const char *const kMonitoringReadScope = "https://www.googleapis.com/auth/monitoring.read";
 
 //! Google's public OAuth2 token endpoint. Credentials files normally carry their own `token_uri`;
 //! this is the fallback when they do not.
@@ -245,13 +246,13 @@ static int64_t NowEpochSeconds() {
 //! Build the signed JWT a service account presents to the token endpoint in exchange for an access
 //! token (RFC 7523 §2.1, "urn:ietf:params:oauth:grant-type:jwt-bearer").
 static string BuildServiceAccountAssertion(const string &client_email, const string &private_key_pem,
-                                           const string &token_uri) {
+                                           const string &token_uri, const string &scope) {
 	int64_t issued_at = NowEpochSeconds();
 	int64_t expires_at = issued_at + 3600; // Google caps assertion lifetime at 1 hour.
 
 	string header = R"({"alg":"RS256","typ":"JWT"})";
 	string claims = StringUtil::Format(R"({"iss":"%s","scope":"%s","aud":"%s","exp":%lld,"iat":%lld})", client_email,
-	                                   kLoggingReadScope, token_uri, static_cast<long long>(expires_at),
+	                                   scope, token_uri, static_cast<long long>(expires_at),
 	                                   static_cast<long long>(issued_at));
 
 	string signing_input = Base64UrlEncode(header) + "." + Base64UrlEncode(claims);
@@ -356,7 +357,7 @@ static std::unordered_map<string, CachedToken> g_token_cache; // NOLINT: process
 //! fresh `gcloud auth application-default login` never replays a token from the old file.
 static string TokenCacheKey(const string &credentials_path, const GcloudAuthConfig &config) {
 	return credentials_path + "|" + std::to_string(FileMTime(credentials_path)) + "|" + config.quota_project + "|" +
-	       kLoggingReadScope;
+	       config.scope;
 }
 
 void InvalidateGcloudTokenCache(const GcloudAuthConfig &config) {
@@ -401,7 +402,7 @@ static void MintFromServiceAccount(const GcloudAuthConfig &config, yyjson_val *r
 	if (!client_email || !private_key) {
 		throw InvalidInputException("service_account credentials must carry `client_email` and `private_key`");
 	}
-	string assertion = BuildServiceAccountAssertion(client_email, private_key, token_uri);
+	string assertion = BuildServiceAccountAssertion(client_email, private_key, token_uri, config.scope);
 	string body = "grant_type=" + StringUtil::URLEncode("urn:ietf:params:oauth:grant-type:jwt-bearer");
 	body += "&assertion=" + StringUtil::URLEncode(assertion);
 	PostTokenRequest(config, token_uri, body, out_token, out_expiry);

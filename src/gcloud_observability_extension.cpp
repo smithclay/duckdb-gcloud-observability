@@ -2,6 +2,7 @@
 
 #include "gcloud_observability_extension.hpp"
 
+#include "gcloud_catalog.hpp"
 #include "gcloud_secret.hpp"
 #include "logs_table.hpp"
 
@@ -15,6 +16,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// reader still works, falling back to Application Default Credentials.
 	RegisterGcloudSecretType(loader);
 	// Reader: SELECT * FROM read_gcloud_logs(project => '...', filter => '...').
+	// Catalog: ATTACH 'gcloud:' AS gcp (TYPE gcloud, PROJECT '...').
+	RegisterGcloudCatalog(loader);
 	RegisterGcloudLogsFunction(loader);
 }
 

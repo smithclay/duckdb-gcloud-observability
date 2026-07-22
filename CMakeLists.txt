@@ -32,7 +32,8 @@ endif()
 include_directories(src/include)
 
 set(EXTENSION_SOURCES src/gcloud_observability_extension.cpp src/gcloud_secret.cpp src/gcloud_auth.cpp
-                      src/gcloud_client.cpp src/gcloud_json.cpp src/logs_table.cpp)
+                      src/gcloud_client.cpp src/gcloud_json.cpp src/logs_table.cpp
+                      src/alerts_table.cpp src/gcloud_catalog.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -46,6 +47,17 @@ foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
   target_compile_definitions(${target} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
   target_link_libraries(${target} OpenSSL::SSL OpenSSL::Crypto)
 endforeach()
+
+# Offline C++ test for the pure request-building and response-parsing helpers. Deliberately a C++
+# test rather than test-only SQL functions, keeping internals out of the extension's SQL surface.
+add_executable(gcloud_json_test EXCLUDE_FROM_ALL test/cpp/gcloud_json_test.cpp src/gcloud_json.cpp)
+target_include_directories(
+  gcloud_json_test PRIVATE src/include
+                           "${GCLOUD_DUCKDB_DIR}/third_party/yyjson/include")
+target_link_libraries(gcloud_json_test dummy_static_extension_loader duckdb_static)
+set_target_properties(
+  gcloud_json_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                              "${CMAKE_BINARY_DIR}/extension/gcloud_observability")
 
 install(
   TARGETS ${EXTENSION_NAME}

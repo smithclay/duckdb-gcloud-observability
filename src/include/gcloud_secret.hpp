@@ -24,9 +24,14 @@ struct GcloudCredentials {
 	//! Universe domain, for Sovereign Cloud / non-standard universes. The Cloud Logging endpoint is
 	//! derived as `https://logging.<universe_domain>` unless `endpoint` overrides it wholesale.
 	string universe_domain = "googleapis.com";
-	//! Full override of the API base, e.g. "https://logging.googleapis.com". Empty => derive from
-	//! `universe_domain`. Mirrors googlecloudmonitoringreceiver's `endpoint` option.
+	//! Full override of the Cloud Logging API base, e.g. "https://logging.googleapis.com". Empty =>
+	//! derive from `universe_domain`. Mirrors googlecloudmonitoringreceiver's `endpoint` option.
 	string endpoint;
+	//! Full override of the Cloud Monitoring API base (the alerts tables), e.g.
+	//! "https://monitoring.googleapis.com". Separate from `endpoint` because the two APIs live on
+	//! different hosts, so one override cannot stand in for both. Empty => derive from
+	//! `universe_domain`.
+	string monitoring_endpoint;
 	//! Skip TLS certificate/hostname verification. Must stay false against real Google endpoints.
 	bool insecure_tls = false;
 };
@@ -46,5 +51,9 @@ GcloudCredentials GetGcloudCredentials(ClientContext &context, const string &sec
 //! Base URL for the Cloud Logging API implied by `credentials` (`endpoint` wins over
 //! `universe_domain`), with any trailing '/' removed.
 string GcloudLoggingEndpoint(const GcloudCredentials &credentials);
+
+//! Base URL for the Cloud Monitoring API implied by `credentials` (`monitoring_endpoint` wins over
+//! `universe_domain`), with any trailing '/' removed.
+string GcloudMonitoringEndpoint(const GcloudCredentials &credentials);
 
 } // namespace duckdb

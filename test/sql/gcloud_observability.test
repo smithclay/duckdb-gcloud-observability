@@ -149,3 +149,179 @@ statement error
 SELECT * FROM read_gcloud_logs(project => 'my-project', bogus_param => 10);
 ----
 Invalid named parameter
+
+# ---------------------------------------------------------------------------
+# Conservative WHERE pushdown
+# ---------------------------------------------------------------------------
+# Planning is offline: pushdown_complex_filter runs during optimization and no token is minted
+# until the first scan, so EXPLAIN shows the outgoing filter without touching the network.
+# FORMAT JSON avoids the box renderer, which would wrap long filters across lines.
+
+# severity_text equality reaches the API as a `severity` term.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p') WHERE severity_text = 'ERROR';
+----
+physical_plan	<REGEX>:.*severity = ..ERROR.*
+
+# An IN list becomes a parenthesized OR so the surrounding AND-chain is not broken.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p')
+WHERE severity_text IN ('ERROR', 'CRITICAL');
+----
+physical_plan	<REGEX>:.*severity = ..ERROR.. OR severity = ..CRITICAL.*
+
+# Severity comparison is by enum name, so a lowercase constant still pushes the uppercase member;
+# DuckDB's own case-sensitive filter stays above the scan and decides the final rows.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p') WHERE severity_text = 'error';
+----
+physical_plan	<REGEX>:.*severity = ..ERROR.*
+
+# The optimizer folds `>= AND <=` into a BETWEEN, which must still push both bounds.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p')
+WHERE time_unix_nano >= TIMESTAMP_NS '2026-07-20 10:00:00'
+  AND time_unix_nano <= TIMESTAMP_NS '2026-07-21 10:00:00';
+----
+physical_plan	<REGEX>:.*timestamp >= ..2026-07-20T10:00:00Z.. AND timestamp <= ..2026-07-21T10:00:00Z.*
+
+# Contradictory bounds never reach the API: DuckDB's own optimizer folds them away before the scan
+# is planned, so the extension is never asked for a request. (The scan additionally refuses to issue
+# one if such bounds ever do reach it -- see GcloudFilterPushdown::empty_result.)
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p')
+WHERE time_unix_nano >= TIMESTAMP_NS '2026-07-21 10:00:00'
+  AND time_unix_nano <= TIMESTAMP_NS '2026-07-20 10:00:00';
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# A value that is not a Cloud Logging LogSeverity member is never pushed.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p') WHERE severity_text = 'FATAL';
+----
+physical_plan	<!REGEX>:.*Google Cloud Filter.*
+
+# service_name is derived by falling back across several API fields, so any single filter term
+# would match strictly fewer rows than the SQL predicate. It must stay a local filter.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p') WHERE service_name = 'checkout';
+----
+physical_plan	<!REGEX>:.*Google Cloud Filter.*
+
+# trace_id is excluded for the same reason: the mapping accepts both the
+# "projects/P/traces/ID" form and a bare id.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p') WHERE trace_id = 'abc';
+----
+physical_plan	<!REGEX>:.*Google Cloud Filter.*
+
+# An OR is not decomposed: pushing one branch alone would drop rows matching only the other.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p')
+WHERE severity_text = 'ERROR' OR body = 'x';
+----
+physical_plan	<!REGEX>:.*Google Cloud Filter.*
+
+# max_rows caps rows as they arrive from the API, before the SQL WHERE runs, so pushdown is
+# disabled: otherwise the cap would apply to a different population than it does without it.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM read_gcloud_logs(project => 'p', max_rows => 1)
+WHERE severity_text = 'ERROR';
+----
+physical_plan	<!REGEX>:.*Google Cloud Filter.*
+
+# ---------------------------------------------------------------------------
+# Catalog (ATTACH 'gcloud:')
+# ---------------------------------------------------------------------------
+
+statement ok
+ATTACH 'gcloud:' AS gcp (TYPE gcloud, PROJECT 'my-project', START_TIME '-1h');
+
+# One log table plus the two Cloud Monitoring alert tables.
+query II
+SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'gcp'
+ORDER BY table_schema, table_name;
+----
+alerts	open
+alerts	policies
+logs	entries
+
+# The catalog log table carries the same 18-column OTLP schema as the reader.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM gcp.logs.entries);
+----
+18
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM gcp.alerts.open);
+----
+9
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM gcp.alerts.policies);
+----
+11
+
+# Pushdown applies to catalog tables too, ANDed onto the attachment's own time bound.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM gcp.logs.entries WHERE severity_text = 'ALERT';
+----
+physical_plan	<REGEX>:.*severity = ..ALERT.*
+
+# Binding and planning an alert table is network-free; Cloud Monitoring is called only on scan.
+query II
+EXPLAIN (FORMAT JSON) SELECT incident_id, state FROM gcp.alerts.open;
+----
+physical_plan	<REGEX>:.*state=open.*
+
+# The catalog is read-only.
+statement error
+CREATE TABLE gcp.logs.new_table (a INTEGER);
+----
+read-only
+
+statement error
+DROP TABLE gcp.logs.entries;
+----
+read-only
+
+statement ok
+DETACH gcp;
+
+# ATTACH reuses the reader's validator, so the two interfaces' rules cannot drift.
+statement error
+ATTACH 'gcloud:' AS bad (TYPE gcloud, BOGUS_OPTION 'x');
+----
+Unsupported gcloud ATTACH option
+
+statement error
+ATTACH 'gcloud:' AS bad (TYPE gcloud, ORDER_BY 'severity desc');
+----
+order_by must be 'timestamp desc' or 'timestamp asc'
+
+statement error
+ATTACH 'gcloud:' AS bad (TYPE gcloud, PAGE_SIZE 5000);
+----
+page_size must be between 1 and 1000
+
+statement error
+ATTACH 'gcloud:' AS bad (TYPE gcloud, MAX_ROWS -1);
+----
+max_rows must be >= 0
+
+statement error
+ATTACH 'gcloud:' AS bad (TYPE gcloud, TIMEOUT 0);
+----
+timeout must be >= 1
+
+# Only the 'gcloud:' path is accepted.
+statement error
+ATTACH 'gcloud://something' AS bad (TYPE gcloud);
+----
+must be attached from the path 'gcloud:'
+
+# A named secret that does not exist fails at attach time, not at first query.
+statement error
+ATTACH 'gcloud:' AS bad (TYPE gcloud, SECRET 'no_such_secret');
+----
+No secret with name 'no_such_secret' found
