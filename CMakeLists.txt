@@ -32,7 +32,7 @@ endif()
 include_directories(src/include)
 
 set(EXTENSION_SOURCES src/gcloud_observability_extension.cpp src/gcloud_secret.cpp src/gcloud_auth.cpp
-                      src/gcloud_client.cpp src/logs_table.cpp)
+                      src/gcloud_client.cpp src/gcloud_json.cpp src/logs_table.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

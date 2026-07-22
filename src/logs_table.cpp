@@ -1,51 +1,31 @@
 #include "logs_table.hpp"
 
 #include "gcloud_client.hpp"
+#include "gcloud_json.hpp"
 #include "gcloud_secret.hpp"
+#include "gcloud_yyjson.hpp"
 
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
-#include "yyjson.hpp"
-
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <deque>
-#include <initializer_list>
-#include <memory>
 
 using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
-
-//===--------------------------------------------------------------------===//
-// yyjson RAII helpers — free docs/buffers on every path (incl. exceptions)
-//===--------------------------------------------------------------------===//
-namespace {
-struct YyjsonDocDeleter {
-	void operator()(yyjson_doc *doc) const {
-		yyjson_doc_free(doc);
-	}
-};
-struct YyjsonMutDocDeleter {
-	void operator()(yyjson_mut_doc *doc) const {
-		yyjson_mut_doc_free(doc);
-	}
-};
-struct YyjsonFreeDeleter {
-	void operator()(char *ptr) const {
-		free(ptr);
-	}
-};
-using YyjsonDocPtr = std::unique_ptr<yyjson_doc, YyjsonDocDeleter>;
-using YyjsonMutDocPtr = std::unique_ptr<yyjson_mut_doc, YyjsonMutDocDeleter>;
-using YyjsonStrPtr = std::unique_ptr<char, YyjsonFreeDeleter>;
-} // namespace
 
 //===--------------------------------------------------------------------===//
 // Output schema — matches duckdb-otlp `read_otlp_logs`
@@ -65,7 +45,7 @@ static constexpr idx_t COL_LOG_ATTRS = 15;
 static constexpr idx_t COL_FLAGS = 17;
 static constexpr idx_t COLUMN_COUNT = 18;
 
-static void GetLogsSchema(vector<LogicalType> &types, vector<string> &names) {
+void GetGcloudLogsSchema(vector<LogicalType> &types, vector<string> &names) {
 	names = {"time_unix_nano",
 	         "observed_time_unix_nano",
 	         "trace_id",
@@ -90,116 +70,6 @@ static void GetLogsSchema(vector<LogicalType> &types, vector<string> &names) {
 	         LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR, LogicalType::VARCHAR,
 	         LogicalType::INTEGER,      LogicalType::INTEGER};
 	D_ASSERT(names.size() == COLUMN_COUNT && types.size() == COLUMN_COUNT);
-}
-
-//===--------------------------------------------------------------------===//
-// Small yyjson accessors
-//===--------------------------------------------------------------------===//
-
-static const char *GetStr(yyjson_val *obj, const char *key) {
-	if (!obj) {
-		return nullptr;
-	}
-	yyjson_val *v = yyjson_obj_get(obj, key);
-	return (v && yyjson_is_str(v)) ? yyjson_get_str(v) : nullptr;
-}
-
-//! Return the object at `key`, or nullptr when absent or not an object.
-static yyjson_val *GetObj(yyjson_val *obj, const char *key) {
-	if (!obj) {
-		return nullptr;
-	}
-	yyjson_val *v = yyjson_obj_get(obj, key);
-	return (v && yyjson_is_obj(v)) ? v : nullptr;
-}
-
-//! Look up a string under any of `keys`, checking each source object in priority order. Returns the
-//! first match, or nullptr.
-static const char *LookupStr(std::initializer_list<yyjson_val *> sources, std::initializer_list<const char *> keys) {
-	for (yyjson_val *source : sources) {
-		for (const char *key : keys) {
-			if (const char *v = GetStr(source, key)) {
-				return v;
-			}
-		}
-	}
-	return nullptr;
-}
-
-//! Google encodes int64 fields as JSON *strings* (proto3 JSON mapping) but int32 fields as numbers,
-//! so `status` arrives as 200 while `requestSize` arrives as "1234". Accept either.
-static bool GetInt64Flexible(yyjson_val *obj, const char *key, int64_t &out) {
-	if (!obj) {
-		return false;
-	}
-	yyjson_val *v = yyjson_obj_get(obj, key);
-	if (!v) {
-		return false;
-	}
-	if (yyjson_is_int(v)) {
-		out = yyjson_get_sint(v);
-		return true;
-	}
-	if (yyjson_is_num(v)) {
-		out = static_cast<int64_t>(yyjson_get_num(v));
-		return true;
-	}
-	if (yyjson_is_str(v)) {
-		const char *str = yyjson_get_str(v);
-		char *end = nullptr;
-		long long parsed = std::strtoll(str, &end, 10);
-		if (end && end != str && *end == '\0') {
-			out = static_cast<int64_t>(parsed);
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool GetBool(yyjson_val *obj, const char *key, bool &out) {
-	if (!obj) {
-		return false;
-	}
-	yyjson_val *v = yyjson_obj_get(obj, key);
-	if (v && yyjson_is_bool(v)) {
-		out = yyjson_get_bool(v);
-		return true;
-	}
-	return false;
-}
-
-//===--------------------------------------------------------------------===//
-// Mutable-JSON builders for the two attribute bags
-//===--------------------------------------------------------------------===//
-
-//! Both key and value are copied into `doc`, so callers may pass transient strings.
-static void PutStr(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *key, const char *value) {
-	if (!key || !value || !*value) {
-		return;
-	}
-	yyjson_mut_obj_add(root, yyjson_mut_strcpy(doc, key), yyjson_mut_strcpy(doc, value));
-}
-
-static void PutInt(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *key, int64_t value) {
-	yyjson_mut_obj_add(root, yyjson_mut_strcpy(doc, key), yyjson_mut_sint(doc, value));
-}
-
-static void PutBool(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *key, bool value) {
-	yyjson_mut_obj_add(root, yyjson_mut_strcpy(doc, key), yyjson_mut_bool(doc, value));
-}
-
-static void PutDouble(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *key, double value) {
-	yyjson_mut_obj_add(root, yyjson_mut_strcpy(doc, key), yyjson_mut_real(doc, value));
-}
-
-//! Serialize a mutable doc, returning "" when the object ended up empty (so the column stays NULL
-//! rather than holding a useless "{}").
-static string WriteIfAny(yyjson_mut_doc *doc, yyjson_mut_val *root) {
-	if (yyjson_mut_obj_size(root) == 0) {
-		return string();
-	}
-	YyjsonStrPtr json(yyjson_mut_write(doc, 0, nullptr));
-	return json ? string(json.get()) : string();
 }
 
 //! Lowercase, converting camelCase boundaries to '_' while leaving '.' and existing '_' alone.
@@ -235,7 +105,7 @@ static void PutLabels(yyjson_mut_doc *doc, yyjson_mut_val *root, yyjson_val *lab
 			continue;
 		}
 		auto attribute_key = ToSnakeCase("gcp.label." + string(key_str));
-		PutStr(doc, root, attribute_key.c_str(), yyjson_get_str(val));
+		GcloudPutStr(doc, root, attribute_key.c_str(), yyjson_get_str(val));
 	}
 }
 
@@ -287,42 +157,10 @@ static int32_t SeverityToNumber(const char *severity) {
 	return 0; // DEFAULT, and anything unrecognized.
 }
 
-//! Parse an RFC 3339 timestamp (e.g. "2026-07-09T10:30:45.123456789Z") into nanoseconds since epoch.
-//! Cloud Logging timestamps carry up to nanosecond precision, so the microsecond-truncating path is
-//! not enough on its own — `sub_micro_nanos` recovers the last three digits.
-static bool ParseRfc3339ToNanos(const char *str, int64_t &out_nanos) {
-	if (!str) {
-		return false;
-	}
-	idx_t len = strlen(str);
-
-	timestamp_t ts;
-	bool has_offset = false;
-	string_t tz;
-	int32_t sub_micro_nanos = 0;
-	auto result = Timestamp::TryConvertTimestampTZ(str, len, ts, /*use_offset=*/true, has_offset, tz, &sub_micro_nanos);
-	if (result != TimestampCastResult::SUCCESS) {
-		// Fall back to the strict (offset-less) nanosecond parser.
-		timestamp_ns_t ts_ns;
-		if (Timestamp::TryConvertTimestamp(str, len, ts_ns) != TimestampCastResult::SUCCESS) {
-			return false;
-		}
-		out_nanos = ts_ns.value;
-		return true;
-	}
-
-	int64_t epoch_nanos;
-	if (!Timestamp::TryGetEpochNanoSeconds(ts, epoch_nanos)) {
-		return false;
-	}
-	out_nanos = epoch_nanos + sub_micro_nanos;
-	return true;
-}
-
 //! Read a LogEntry timestamp field into a TIMESTAMP_NS Value; NULL when absent or unparseable.
 static Value TimestampValue(yyjson_val *entry, const char *key) {
 	int64_t nanos;
-	if (ParseRfc3339ToNanos(GetStr(entry, key), nanos)) {
+	if (ParseRfc3339ToNanos(GcloudGetStr(entry, key), nanos)) {
 		return Value::TIMESTAMPNS(timestamp_ns_t(nanos));
 	}
 	return Value();
@@ -375,8 +213,8 @@ static void PutLogNameAttributes(yyjson_mut_doc *doc, yyjson_mut_val *root, cons
 		if (parent_id.empty() || log_id.empty()) {
 			return;
 		}
-		PutStr(doc, root, parent.attribute, parent_id.c_str());
-		PutStr(doc, root, "cloud.resource_id", log_id.c_str());
+		GcloudPutStr(doc, root, parent.attribute, parent_id.c_str());
+		GcloudPutStr(doc, root, "cloud.resource_id", log_id.c_str());
 		return;
 	}
 }
@@ -387,11 +225,11 @@ static string BuildResourceAttributes(yyjson_val *entry, yyjson_val *resource, y
 	yyjson_mut_val *root = yyjson_mut_obj(doc.get());
 	yyjson_mut_doc_set_root(doc.get(), root);
 
-	PutLogNameAttributes(doc.get(), root, GetStr(entry, "logName"));
-	PutStr(doc.get(), root, "gcp.resource_type", GetStr(resource, "type"));
+	PutLogNameAttributes(doc.get(), root, GcloudGetStr(entry, "logName"));
+	GcloudPutStr(doc.get(), root, "gcp.resource_type", GcloudGetStr(resource, "type"));
 	PutLabels(doc.get(), root, resource_labels);
 
-	return WriteIfAny(doc.get(), root);
+	return GcloudWriteIfAny(doc.get(), root);
 }
 
 //! LogEntry.httpRequest -> OpenTelemetry HTTP semantic-convention attributes.
@@ -399,66 +237,66 @@ static void PutHttpRequest(yyjson_mut_doc *doc, yyjson_mut_val *root, yyjson_val
 	if (!request) {
 		return;
 	}
-	PutStr(doc, root, "http.request.method", GetStr(request, "requestMethod"));
-	PutStr(doc, root, "url.full", GetStr(request, "requestUrl"));
-	PutStr(doc, root, "user_agent.original", GetStr(request, "userAgent"));
-	PutStr(doc, root, "network.peer.address", GetStr(request, "remoteIp"));
-	PutStr(doc, root, "server.address", GetStr(request, "serverIp"));
-	PutStr(doc, root, "http.request.header.referer", GetStr(request, "referer"));
+	GcloudPutStr(doc, root, "http.request.method", GcloudGetStr(request, "requestMethod"));
+	GcloudPutStr(doc, root, "url.full", GcloudGetStr(request, "requestUrl"));
+	GcloudPutStr(doc, root, "user_agent.original", GcloudGetStr(request, "userAgent"));
+	GcloudPutStr(doc, root, "network.peer.address", GcloudGetStr(request, "remoteIp"));
+	GcloudPutStr(doc, root, "server.address", GcloudGetStr(request, "serverIp"));
+	GcloudPutStr(doc, root, "http.request.header.referer", GcloudGetStr(request, "referer"));
 
 	int64_t status = 0;
-	if (GetInt64Flexible(request, "status", status)) {
-		PutInt(doc, root, "http.response.status_code", status);
+	if (GcloudGetInt64Flexible(request, "status", status)) {
+		GcloudPutInt(doc, root, "http.response.status_code", status);
 	}
 	int64_t request_size = 0;
-	if (GetInt64Flexible(request, "requestSize", request_size)) {
-		PutInt(doc, root, "http.request.body.size", request_size);
+	if (GcloudGetInt64Flexible(request, "requestSize", request_size)) {
+		GcloudPutInt(doc, root, "http.request.body.size", request_size);
 	}
 	int64_t response_size = 0;
-	if (GetInt64Flexible(request, "responseSize", response_size)) {
-		PutInt(doc, root, "http.response.body.size", response_size);
+	if (GcloudGetInt64Flexible(request, "responseSize", response_size)) {
+		GcloudPutInt(doc, root, "http.response.body.size", response_size);
 	}
 	int64_t cache_fill_bytes = 0;
-	if (GetInt64Flexible(request, "cacheFillBytes", cache_fill_bytes)) {
-		PutInt(doc, root, "gcp.cache.fill_bytes", cache_fill_bytes);
+	if (GcloudGetInt64Flexible(request, "cacheFillBytes", cache_fill_bytes)) {
+		GcloudPutInt(doc, root, "gcp.cache.fill_bytes", cache_fill_bytes);
 	}
 
 	// `latency` is a proto Duration in JSON form: a decimal number of seconds with an "s" suffix.
-	if (const char *latency = GetStr(request, "latency")) {
+	if (const char *latency = GcloudGetStr(request, "latency")) {
 		string value(latency);
 		if (!value.empty() && value.back() == 's') {
 			value.pop_back();
 			char *end = nullptr;
 			double seconds = std::strtod(value.c_str(), &end);
 			if (end && end != value.c_str() && *end == '\0') {
-				PutDouble(doc, root, "http.request.server.duration", seconds);
+				GcloudPutDouble(doc, root, "http.request.server.duration", seconds);
 			}
 		}
 	}
 
 	// "HTTP/1.1" -> name "http", version "1.1"; anything unrecognized is kept whole, lowercased.
-	if (const char *protocol = GetStr(request, "protocol")) {
+	if (const char *protocol = GcloudGetStr(request, "protocol")) {
 		string value(protocol);
 		auto slash = value.find('/');
 		if (slash != string::npos && slash + 1 < value.size()) {
 			auto name = StringUtil::Lower(value.substr(0, slash));
-			PutStr(doc, root, "network.protocol.name", name.c_str());
-			PutStr(doc, root, "network.protocol.version", value.substr(slash + 1).c_str());
+			GcloudPutStr(doc, root, "network.protocol.name", name.c_str());
+			GcloudPutStr(doc, root, "network.protocol.version", value.substr(slash + 1).c_str());
 		} else {
 			auto name = StringUtil::Lower(value);
-			PutStr(doc, root, "network.protocol.name", name.c_str());
+			GcloudPutStr(doc, root, "network.protocol.name", name.c_str());
 		}
 	}
 
 	bool flag = false;
-	if (GetBool(request, "cacheLookup", flag)) {
-		PutBool(doc, root, "gcp.cache.lookup", flag);
+	if (GcloudGetBool(request, "cacheLookup", flag)) {
+		GcloudPutBool(doc, root, "gcp.cache.lookup", flag);
 	}
-	if (GetBool(request, "cacheHit", flag)) {
-		PutBool(doc, root, "gcp.cache.hit", flag);
+	if (GcloudGetBool(request, "cacheHit", flag)) {
+		GcloudPutBool(doc, root, "gcp.cache.hit", flag);
 	}
-	if (GetBool(request, "cacheValidatedWithOriginServer", flag)) {
-		PutBool(doc, root, "gcp.cache.validated_with_origin_server", flag);
+	if (GcloudGetBool(request, "cacheValidatedWithOriginServer", flag)) {
+		GcloudPutBool(doc, root, "gcp.cache.validated_with_origin_server", flag);
 	}
 }
 
@@ -467,11 +305,11 @@ static void PutSourceLocation(yyjson_mut_doc *doc, yyjson_mut_val *root, yyjson_
 	if (!location) {
 		return;
 	}
-	PutStr(doc, root, "code.file.path", GetStr(location, "file"));
-	PutStr(doc, root, "code.function.name", GetStr(location, "function"));
+	GcloudPutStr(doc, root, "code.file.path", GcloudGetStr(location, "file"));
+	GcloudPutStr(doc, root, "code.function.name", GcloudGetStr(location, "function"));
 	int64_t line = 0;
-	if (GetInt64Flexible(location, "line", line)) {
-		PutInt(doc, root, "code.line.number", line);
+	if (GcloudGetInt64Flexible(location, "line", line)) {
+		GcloudPutInt(doc, root, "code.line.number", line);
 	}
 }
 
@@ -480,14 +318,14 @@ static void PutOperation(yyjson_mut_doc *doc, yyjson_mut_val *root, yyjson_val *
 	if (!operation) {
 		return;
 	}
-	PutStr(doc, root, "gcp.operation.id", GetStr(operation, "id"));
-	PutStr(doc, root, "gcp.operation.producer", GetStr(operation, "producer"));
+	GcloudPutStr(doc, root, "gcp.operation.id", GcloudGetStr(operation, "id"));
+	GcloudPutStr(doc, root, "gcp.operation.producer", GcloudGetStr(operation, "producer"));
 	bool flag = false;
-	if (GetBool(operation, "first", flag)) {
-		PutBool(doc, root, "gcp.operation.first", flag);
+	if (GcloudGetBool(operation, "first", flag)) {
+		GcloudPutBool(doc, root, "gcp.operation.first", flag);
 	}
-	if (GetBool(operation, "last", flag)) {
-		PutBool(doc, root, "gcp.operation.last", flag);
+	if (GcloudGetBool(operation, "last", flag)) {
+		GcloudPutBool(doc, root, "gcp.operation.last", flag);
 	}
 }
 
@@ -516,23 +354,14 @@ static string BuildLogAttributes(yyjson_val *entry, yyjson_val *json_payload) {
 	yyjson_mut_val *root = yyjson_mut_obj(doc.get());
 	yyjson_mut_doc_set_root(doc.get(), root);
 
-	PutStr(doc.get(), root, "log.record.uid", GetStr(entry, "insertId"));
+	GcloudPutStr(doc.get(), root, "log.record.uid", GcloudGetStr(entry, "insertId"));
 	PutLabels(doc.get(), root, yyjson_obj_get(entry, "labels"));
-	PutHttpRequest(doc.get(), root, GetObj(entry, "httpRequest"));
-	PutSourceLocation(doc.get(), root, GetObj(entry, "sourceLocation"));
-	PutOperation(doc.get(), root, GetObj(entry, "operation"));
+	PutHttpRequest(doc.get(), root, GcloudGetObj(entry, "httpRequest"));
+	PutSourceLocation(doc.get(), root, GcloudGetObj(entry, "sourceLocation"));
+	PutOperation(doc.get(), root, GcloudGetObj(entry, "operation"));
 	MergeJsonPayload(doc.get(), root, json_payload);
 
-	return WriteIfAny(doc.get(), root);
-}
-
-//! Serialize an arbitrary JSON value back to compact text (used for a structured payload body).
-static string WriteValue(yyjson_val *value) {
-	if (!value) {
-		return string();
-	}
-	YyjsonStrPtr json(yyjson_val_write(value, 0, nullptr));
-	return json ? string(json.get()) : string();
+	return GcloudWriteIfAny(doc.get(), root);
 }
 
 //! The log message. Cloud Logging entries carry exactly one payload; a textPayload *is* the message,
@@ -540,17 +369,17 @@ static string WriteValue(yyjson_val *value) {
 //! back to the serialized payload keeps `body` non-NULL for entries that follow neither convention
 //! (audit logs, VPC flow logs), whose fields remain individually queryable via `log_attributes`.
 static string BuildBody(yyjson_val *entry, yyjson_val *json_payload) {
-	if (const char *text = GetStr(entry, "textPayload")) {
+	if (const char *text = GcloudGetStr(entry, "textPayload")) {
 		return string(text);
 	}
 	if (json_payload) {
-		if (const char *message = LookupStr({json_payload}, {"message", "msg"})) {
+		if (const char *message = GcloudLookupStr({json_payload}, {"message", "msg"})) {
 			return string(message);
 		}
-		return WriteValue(json_payload);
+		return GcloudWriteValue(json_payload);
 	}
-	if (yyjson_val *proto_payload = GetObj(entry, "protoPayload")) {
-		return WriteValue(proto_payload);
+	if (yyjson_val *proto_payload = GcloudGetObj(entry, "protoPayload")) {
+		return GcloudWriteValue(proto_payload);
 	}
 	return string();
 }
@@ -562,10 +391,10 @@ static string BuildBody(yyjson_val *entry, yyjson_val *json_payload) {
 static void MapEntry(yyjson_val *entry, const vector<column_t> &column_ids, vector<Value> &row) {
 	row.assign(column_ids.size(), Value()); // all projected columns NULL by default
 
-	yyjson_val *resource = GetObj(entry, "resource");
-	yyjson_val *resource_labels = GetObj(resource, "labels");
-	yyjson_val *labels = GetObj(entry, "labels");
-	yyjson_val *json_payload = GetObj(entry, "jsonPayload");
+	yyjson_val *resource = GcloudGetObj(entry, "resource");
+	yyjson_val *resource_labels = GcloudGetObj(resource, "labels");
+	yyjson_val *labels = GcloudGetObj(entry, "labels");
+	yyjson_val *json_payload = GcloudGetObj(entry, "jsonPayload");
 
 	for (idx_t c = 0; c < column_ids.size(); c++) {
 		switch (column_ids[c]) {
@@ -581,29 +410,29 @@ static void MapEntry(yyjson_val *entry, const vector<column_t> &column_ids, vect
 			break;
 		}
 		case COL_TRACE_ID: {
-			auto trace_id = ExtractTraceId(GetStr(entry, "trace"));
+			auto trace_id = ExtractTraceId(GcloudGetStr(entry, "trace"));
 			if (!trace_id.empty()) {
 				row[c] = Value(trace_id);
 			}
 			break;
 		}
 		case COL_SPAN_ID:
-			if (const char *span_id = GetStr(entry, "spanId")) {
+			if (const char *span_id = GcloudGetStr(entry, "spanId")) {
 				row[c] = Value(string(span_id));
 			}
 			break;
 		case COL_SERVICE_NAME: {
 			// Cloud Run / Cloud Functions / GKE name the workload in different resource labels;
 			// structured loggers usually carry it in the payload. Check the explicit ones first.
-			const char *service = LookupStr({resource_labels}, {"service_name"});
+			const char *service = GcloudLookupStr({resource_labels}, {"service_name"});
 			if (!service) {
-				service = LookupStr({json_payload}, {"service", "service_name", "serviceName", "service.name"});
+				service = GcloudLookupStr({json_payload}, {"service", "service_name", "serviceName", "service.name"});
 			}
 			if (!service) {
-				service = LookupStr({labels}, {"service_name", "service"});
+				service = GcloudLookupStr({labels}, {"service_name", "service"});
 			}
 			if (!service) {
-				service = LookupStr({resource_labels}, {"function_name", "container_name", "job"});
+				service = GcloudLookupStr({resource_labels}, {"function_name", "container_name", "job"});
 			}
 			if (service) {
 				row[c] = Value(string(service));
@@ -611,23 +440,23 @@ static void MapEntry(yyjson_val *entry, const vector<column_t> &column_ids, vect
 			break;
 		}
 		case COL_SERVICE_NAMESPACE:
-			if (const char *namespace_name = LookupStr({resource_labels}, {"namespace_name", "namespace_id"})) {
+			if (const char *namespace_name = GcloudLookupStr({resource_labels}, {"namespace_name", "namespace_id"})) {
 				row[c] = Value(string(namespace_name));
 			}
 			break;
 		case COL_SERVICE_INSTANCE_ID:
 			if (const char *instance =
-			        LookupStr({resource_labels}, {"instance_id", "pod_name", "revision_name", "task_id"})) {
+			        GcloudLookupStr({resource_labels}, {"instance_id", "pod_name", "revision_name", "task_id"})) {
 				row[c] = Value(string(instance));
 			}
 			break;
 		case COL_SEVERITY_NUMBER:
-			if (const char *severity = GetStr(entry, "severity")) {
+			if (const char *severity = GcloudGetStr(entry, "severity")) {
 				row[c] = Value::INTEGER(SeverityToNumber(severity));
 			}
 			break;
 		case COL_SEVERITY_TEXT:
-			if (const char *severity = GetStr(entry, "severity")) {
+			if (const char *severity = GcloudGetStr(entry, "severity")) {
 				row[c] = Value(string(severity));
 			}
 			break;
@@ -655,7 +484,7 @@ static void MapEntry(yyjson_val *entry, const vector<column_t> &column_ids, vect
 		case COL_FLAGS: {
 			// OTLP log record flags: bit 0 mirrors the W3C trace flag "sampled".
 			bool sampled = false;
-			if (GetBool(entry, "traceSampled", sampled)) {
+			if (GcloudGetBool(entry, "traceSampled", sampled)) {
 				row[c] = Value::INTEGER(sampled ? 1 : 0);
 			}
 			break;
@@ -670,132 +499,21 @@ static void MapEntry(yyjson_val *entry, const vector<column_t> &column_ids, vect
 }
 
 //===--------------------------------------------------------------------===//
-// Request building
-//===--------------------------------------------------------------------===//
-
-//! Format epoch seconds as an RFC 3339 UTC timestamp, the only form the Logging query language
-//! accepts in a `timestamp` comparison.
-static string FormatRfc3339(int64_t epoch_seconds) {
-	std::time_t as_time = static_cast<std::time_t>(epoch_seconds);
-	struct tm utc;
-	gmtime_r(&as_time, &utc);
-	char buffer[32];
-	strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc);
-	return string(buffer);
-}
-
-//! Interpret a `start_time`/`end_time` argument. Accepts `now`, a relative offset (`-15m`, `-2h`,
-//! `-7d`, `-30s`) resolved against the current time, or an RFC 3339 instant passed through as-is.
-static string ResolveTimeSpec(const string &parameter, const string &spec) {
-	string trimmed = spec;
-	StringUtil::Trim(trimmed);
-	if (trimmed.empty()) {
-		return string();
-	}
-
-	auto now =
-	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-	if (StringUtil::CIEquals(trimmed, "now")) {
-		return FormatRfc3339(now);
-	}
-	if (trimmed[0] == '-') {
-		char unit = trimmed.back();
-		auto digits = trimmed.substr(1, trimmed.size() - 2);
-		int64_t multiplier = 0;
-		switch (unit) {
-		case 's':
-			multiplier = 1;
-			break;
-		case 'm':
-			multiplier = 60;
-			break;
-		case 'h':
-			multiplier = 3600;
-			break;
-		case 'd':
-			multiplier = 86400;
-			break;
-		default:
-			multiplier = 0;
-		}
-		char *end = nullptr;
-		long long amount = digits.empty() ? -1 : std::strtoll(digits.c_str(), &end, 10);
-		if (multiplier > 0 && amount >= 0 && end && *end == '\0') {
-			return FormatRfc3339(now - static_cast<int64_t>(amount) * multiplier);
-		}
-		throw InvalidInputException("read_gcloud_logs: %s '%s' is not a valid relative offset; expected a number and "
-		                            "one of s/m/h/d, e.g. '-15m'",
-		                            parameter, spec);
-	}
-	// Absolute: require something that at least looks like RFC 3339 so a typo fails here rather
-	// than as an opaque INVALID_ARGUMENT from the API.
-	int64_t nanos;
-	if (!ParseRfc3339ToNanos(trimmed.c_str(), nanos)) {
-		throw InvalidInputException("read_gcloud_logs: %s '%s' is neither a relative offset (e.g. '-15m') nor an "
-		                            "RFC 3339 timestamp (e.g. '2026-07-09T00:00:00Z')",
-		                            parameter, spec);
-	}
-	return trimmed;
-}
-
-//! Compose the final Logging query-language filter from the user's `filter` plus any time bounds.
-//! The user's filter is parenthesized so a top-level `OR` inside it cannot swallow the time bound.
-static string BuildFilter(const string &filter, const string &start_time, const string &end_time) {
-	vector<string> clauses;
-	string trimmed_filter = filter;
-	StringUtil::Trim(trimmed_filter);
-	if (!trimmed_filter.empty()) {
-		clauses.push_back("(" + trimmed_filter + ")");
-	}
-	if (!start_time.empty()) {
-		clauses.push_back("timestamp >= \"" + ResolveTimeSpec("start_time", start_time) + "\"");
-	}
-	if (!end_time.empty()) {
-		clauses.push_back("timestamp <= \"" + ResolveTimeSpec("end_time", end_time) + "\"");
-	}
-	return StringUtil::Join(clauses, " AND ");
-}
-
-//! Build the JSON body for POST /v2/entries:list. yyjson handles escaping, so a filter containing
-//! quotes or backslashes cannot corrupt the request.
-static string BuildListBody(const vector<string> &resource_names, const string &filter, const string &order_by,
-                            int64_t page_size, const string &page_token) {
-	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
-	yyjson_mut_val *root = yyjson_mut_obj(doc.get());
-	yyjson_mut_doc_set_root(doc.get(), root);
-
-	yyjson_mut_val *names = yyjson_mut_arr(doc.get());
-	for (const auto &name : resource_names) {
-		yyjson_mut_arr_add_strcpy(doc.get(), names, name.c_str());
-	}
-	yyjson_mut_obj_add(root, yyjson_mut_strcpy(doc.get(), "resourceNames"), names);
-
-	if (!filter.empty()) {
-		PutStr(doc.get(), root, "filter", filter.c_str());
-	}
-	PutStr(doc.get(), root, "orderBy", order_by.c_str());
-	PutInt(doc.get(), root, "pageSize", page_size);
-	if (!page_token.empty()) {
-		PutStr(doc.get(), root, "pageToken", page_token.c_str());
-	}
-
-	YyjsonStrPtr json(yyjson_mut_write(doc.get(), 0, nullptr));
-	if (!json) {
-		throw InternalException("read_gcloud_logs: could not serialize the entries.list request body");
-	}
-	return string(json.get());
-}
-
-//===--------------------------------------------------------------------===//
 // Table function state
 //===--------------------------------------------------------------------===//
 
 struct GcloudLogsBindData : public TableFunctionData {
 	vector<string> resource_names;
+	//! Filter resolved at bind time from the user's `filter` plus `start_time`/`end_time`. Terms
+	//! translated from the SQL WHERE clause are ANDed on later, in InitGlobal.
 	string filter;
 	string order_by = "timestamp desc";
 	int64_t max_rows = 0;     // 0 = unlimited
 	int64_t page_size = 1000; // entries per API request
+	//! Populated by GcloudLogsPushdownComplexFilter during planning.
+	GcloudFilterPushdown pushdown;
+	//! Set for catalog-backed tables so EXPLAIN can name the table; null for read_gcloud_logs.
+	TableCatalogEntry *table = nullptr;
 	GcloudClient client;
 };
 
@@ -806,6 +524,8 @@ struct GcloudLogsGlobalState : public GlobalTableFunctionState {
 	//! Rows (projected columns only) from the pages fetched so far, waiting to be emitted. Holds at
 	//! most one page, so an unbounded scan streams rather than materializing the whole result set.
 	std::deque<vector<Value>> buffer;
+	//! The bind-time filter with the pushed-down WHERE terms ANDed on — what actually goes to the API.
+	string request_filter;
 	//! Next-page cursor from `nextPageToken` ("" = request the first page).
 	string page_token;
 	idx_t total_emitted = 0;
@@ -816,6 +536,27 @@ struct GcloudLogsGlobalState : public GlobalTableFunctionState {
 	}
 };
 
+void ValidateGcloudLogsSettings(const GcloudLogsSettings &settings, const string &error_prefix) {
+	if (settings.max_rows < 0) {
+		throw InvalidInputException("%s: max_rows must be >= 0 (0 means unlimited)", error_prefix);
+	}
+	if (settings.page_size < 1 || settings.page_size > 1000) {
+		throw InvalidInputException("%s: page_size must be between 1 and 1000", error_prefix);
+	}
+	// entries.list rejects anything else, and silently sorting the wrong way is worse than failing.
+	if (!StringUtil::CIEquals(settings.order_by, "timestamp desc") &&
+	    !StringUtil::CIEquals(settings.order_by, "timestamp asc")) {
+		throw InvalidInputException("%s: order_by must be 'timestamp desc' or 'timestamp asc' (got '%s')", error_prefix,
+		                            settings.order_by);
+	}
+	if (settings.retries < 0) {
+		throw InvalidInputException("%s: retries must be >= 0 (0 disables retrying)", error_prefix);
+	}
+	if (settings.timeout_seconds < 1) {
+		throw InvalidInputException("%s: timeout must be >= 1 (seconds)", error_prefix);
+	}
+}
+
 //! Fetch the next page of entries.list and update pagination state.
 //!
 //! Cloud Logging may return a page with *zero* entries and still hand back a nextPageToken — it
@@ -825,18 +566,16 @@ struct GcloudLogsGlobalState : public GlobalTableFunctionState {
 //! forever, so that case ends the scan too.
 static void FetchNextPage(ClientContext &context, const GcloudLogsBindData &bind, GcloudLogsGlobalState &state) {
 	// Never ask for more rows than the query can still use, so the last page is not over-fetched.
-	int64_t page_size = bind.page_size;
-	if (bind.max_rows > 0) {
-		auto buffered = static_cast<int64_t>(state.total_emitted + state.buffer.size());
-		auto remaining = bind.max_rows - buffered;
-		if (remaining <= 0) {
-			state.finished = true;
-			return;
-		}
-		page_size = MinValue<int64_t>(page_size, remaining);
+	// Rows already buffered but not yet emitted count against the cap too.
+	auto accounted = state.total_emitted + state.buffer.size();
+	auto page_size = GetGcloudLogsPageSize(bind.page_size, bind.max_rows, accounted);
+	if (page_size <= 0) {
+		state.finished = true;
+		return;
 	}
 
-	auto body = BuildListBody(bind.resource_names, bind.filter, bind.order_by, page_size, state.page_token);
+	auto body = BuildGcloudListBody(bind.resource_names, state.request_filter, bind.order_by, page_size,
+	                                state.page_token);
 	auto response = bind.client.ListEntries(context, body);
 
 	YyjsonDocPtr doc(yyjson_read(response.c_str(), response.size(), 0));
@@ -862,7 +601,7 @@ static void FetchNextPage(ClientContext &context, const GcloudLogsBindData &bind
 		}
 	}
 
-	const char *next = GetStr(root, "nextPageToken");
+	const char *next = GcloudGetStr(root, "nextPageToken");
 	if (!next || next[0] == '\0' || state.page_token == next) {
 		state.finished = true;
 	} else {
@@ -870,9 +609,301 @@ static void FetchNextPage(ClientContext &context, const GcloudLogsBindData &bind
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// Conservative WHERE pushdown
+//===--------------------------------------------------------------------===//
+//
+// Only predicates whose Logging-query-language translation matches a *superset* of the SQL match
+// are pushed, because DuckDB keeps evaluating the original WHERE above the scan: a term that is
+// too broad merely costs bandwidth, while one that is too narrow silently drops rows.
+//
+// Two columns qualify. `time_unix_nano` maps to the `timestamp` field verbatim (bounds are rounded
+// outward to whole seconds). `severity_text` maps to `severity` verbatim — it is copied straight
+// from the LogEntry, so equality against a valid LogSeverity name is exact.
+//
+// `service_name` is deliberately *not* pushed, which is where this diverges from duckdb-datadog's
+// `service:` term. There, the column is one API field. Here it is derived by falling back across
+// `resource.labels.service_name`, several `jsonPayload` keys, `labels`, and
+// `resource.labels.{function_name,container_name,job}` — so any single filter term
+// (`resource.labels.service_name="x"`) would match strictly fewer rows than the SQL predicate and
+// would drop legitimate GKE/Cloud Functions results. `trace_id` is excluded for the same reason:
+// ExtractTraceId accepts both the "projects/P/traces/ID" form and a bare id.
+
+static ExpressionType ReverseComparison(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_LESSTHAN:
+		return ExpressionType::COMPARE_GREATERTHAN;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return ExpressionType::COMPARE_LESSTHAN;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return ExpressionType::COMPARE_LESSTHANOREQUALTO;
+	default:
+		return type;
+	}
+}
+
+static constexpr int64_t NANOS_PER_SECOND = 1000000000;
+
+//! Round toward -infinity, so a lower bound never excludes a matching row.
+static int64_t FloorNanosecondsToSeconds(int64_t nanos) {
+	auto seconds = nanos / NANOS_PER_SECOND;
+	if (nanos % NANOS_PER_SECOND < 0) {
+		seconds--;
+	}
+	return seconds;
+}
+
+//! Round toward +infinity, so an upper bound never excludes a matching row.
+static int64_t CeilNanosecondsToSeconds(int64_t nanos) {
+	auto seconds = nanos / NANOS_PER_SECOND;
+	if (nanos % NANOS_PER_SECOND > 0) {
+		seconds++;
+	}
+	return seconds;
+}
+
+//! Resolve `expression` to the source column name it references in `get`, or "" if it is not a
+//! plain column reference into this scan.
+static string GetPushdownColumnName(const LogicalGet &get, const Expression &expression) {
+	if (expression.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return string();
+	}
+	const auto &column = expression.Cast<BoundColumnRefExpression>();
+	const auto &column_ids = get.GetColumnIds();
+	if (column.depth != 0 || column.binding.table_index != get.table_index ||
+	    column.binding.column_index >= column_ids.size()) {
+		return string();
+	}
+	auto source_column = column_ids[column.binding.column_index].GetPrimaryIndex();
+	if (source_column >= get.names.size()) {
+		return string();
+	}
+	return get.names[source_column];
+}
+
+//! Record a `severity_text` value, uppercased so it names a LogSeverity enum member. Returns false
+//! when the constant cannot be a valid severity, in which case nothing is pushed for this
+//! predicate (SQL still filters locally, so the result stays correct).
+static bool AddSeverity(GcloudFilterPushdown &pushdown, const Value &constant) {
+	if (constant.IsNull() || constant.type().id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	auto severity = StringUtil::Upper(constant.GetValue<string>());
+	if (!IsLogSeverityName(severity)) {
+		return false;
+	}
+	for (const auto &existing : pushdown.severities) {
+		if (existing == severity) {
+			return true;
+		}
+	}
+	pushdown.severities.push_back(std::move(severity));
+	return true;
+}
+
+static void AddLowerBound(GcloudFilterPushdown &pushdown, int64_t seconds) {
+	if (!pushdown.has_lower_bound_seconds || seconds > pushdown.lower_bound_seconds) {
+		pushdown.has_lower_bound_seconds = true;
+		pushdown.lower_bound_seconds = seconds;
+	}
+}
+
+static void AddUpperBound(GcloudFilterPushdown &pushdown, int64_t seconds) {
+	if (!pushdown.has_upper_bound_seconds || seconds < pushdown.upper_bound_seconds) {
+		pushdown.has_upper_bound_seconds = true;
+		pushdown.upper_bound_seconds = seconds;
+	}
+}
+
+static void TryPushComparison(const LogicalGet &get, const BoundComparisonExpression &comparison,
+                              GcloudFilterPushdown &pushdown) {
+	const Expression *column_side = nullptr;
+	const BoundConstantExpression *constant = nullptr;
+	auto comparison_type = comparison.type;
+
+	if (comparison.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		column_side = comparison.left.get();
+		constant = &comparison.right->Cast<BoundConstantExpression>();
+	} else if (comparison.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		column_side = comparison.right.get();
+		constant = &comparison.left->Cast<BoundConstantExpression>();
+		comparison_type = ReverseComparison(comparison_type);
+	} else {
+		return;
+	}
+
+	auto column_name = GetPushdownColumnName(get, *column_side);
+	if (column_name.empty() || constant->value.IsNull()) {
+		return;
+	}
+
+	if (column_name == "severity_text" && comparison_type == ExpressionType::COMPARE_EQUAL) {
+		AddSeverity(pushdown, constant->value);
+		return;
+	}
+
+	if (column_name != "time_unix_nano" || constant->value.type().id() != LogicalTypeId::TIMESTAMP_NS) {
+		return;
+	}
+	auto nanos = constant->value.GetValue<timestamp_ns_t>().value;
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		// An equality pins both ends; the outward rounding keeps the second containing it.
+		AddLowerBound(pushdown, FloorNanosecondsToSeconds(nanos));
+		AddUpperBound(pushdown, CeilNanosecondsToSeconds(nanos));
+		break;
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		AddLowerBound(pushdown, FloorNanosecondsToSeconds(nanos));
+		break;
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		AddUpperBound(pushdown, CeilNanosecondsToSeconds(nanos));
+		break;
+	default:
+		break;
+	}
+}
+
+//! `severity_text IN ('ERROR', 'CRITICAL')` becomes an OR of severity equalities. All children must
+//! be constants that name a real LogSeverity, otherwise the whole IN is skipped — pushing only the
+//! recognized subset would narrow the match and drop rows.
+static void TryPushInClause(const LogicalGet &get, const BoundOperatorExpression &operator_expression,
+                            GcloudFilterPushdown &pushdown) {
+	if (operator_expression.children.size() < 2) {
+		return;
+	}
+	if (GetPushdownColumnName(get, *operator_expression.children[0]) != "severity_text") {
+		return;
+	}
+	vector<Value> constants;
+	for (idx_t i = 1; i < operator_expression.children.size(); i++) {
+		const auto &child = *operator_expression.children[i];
+		if (child.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return;
+		}
+		auto value = child.Cast<BoundConstantExpression>().value;
+		if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR ||
+		    !IsLogSeverityName(StringUtil::Upper(value.GetValue<string>()))) {
+			return;
+		}
+		constants.push_back(std::move(value));
+	}
+	for (const auto &value : constants) {
+		AddSeverity(pushdown, value);
+	}
+}
+
+//! DuckDB's optimizer rewrites `x >= a AND x <= b` into a single BETWEEN before this callback runs,
+//! so handling only BOUND_COMPARISON would silently miss the most common way a time window is
+//! written. Inclusivity is irrelevant here: the bounds are rounded outward to whole seconds anyway.
+static void TryPushBetween(const LogicalGet &get, const BoundBetweenExpression &between,
+                           GcloudFilterPushdown &pushdown) {
+	if (GetPushdownColumnName(get, *between.input) != "time_unix_nano") {
+		return;
+	}
+	auto push_side = [&](const Expression &bound, bool is_lower) {
+		if (bound.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return;
+		}
+		const auto &value = bound.Cast<BoundConstantExpression>().value;
+		if (value.IsNull() || value.type().id() != LogicalTypeId::TIMESTAMP_NS) {
+			return;
+		}
+		auto nanos = value.GetValue<timestamp_ns_t>().value;
+		if (is_lower) {
+			AddLowerBound(pushdown, FloorNanosecondsToSeconds(nanos));
+		} else {
+			AddUpperBound(pushdown, CeilNanosecondsToSeconds(nanos));
+		}
+	};
+	push_side(*between.lower, true);
+	push_side(*between.upper, false);
+}
+
+static void TryPushExpression(const LogicalGet &get, const Expression &expression, GcloudFilterPushdown &pushdown) {
+	switch (expression.GetExpressionClass()) {
+	case ExpressionClass::BOUND_COMPARISON:
+		TryPushComparison(get, expression.Cast<BoundComparisonExpression>(), pushdown);
+		return;
+	case ExpressionClass::BOUND_BETWEEN:
+		TryPushBetween(get, expression.Cast<BoundBetweenExpression>(), pushdown);
+		return;
+	case ExpressionClass::BOUND_OPERATOR:
+		if (expression.type == ExpressionType::COMPARE_IN) {
+			TryPushInClause(get, expression.Cast<BoundOperatorExpression>(), pushdown);
+		}
+		return;
+	case ExpressionClass::BOUND_CONJUNCTION:
+		// Only AND: each conjunct independently constrains the result, so pushing any subset stays a
+		// superset. An OR would need every branch pushed together to remain safe.
+		if (expression.type == ExpressionType::CONJUNCTION_AND) {
+			for (const auto &child : expression.Cast<BoundConjunctionExpression>().children) {
+				TryPushExpression(get, *child, pushdown);
+			}
+		}
+		return;
+	default:
+		return;
+	}
+}
+
+static void GcloudLogsPushdownComplexFilter(ClientContext &, LogicalGet &get, FunctionData *bind_data,
+                                            vector<unique_ptr<Expression>> &filters) {
+	auto &bind = bind_data->Cast<GcloudLogsBindData>();
+	bind.pushdown = GcloudFilterPushdown();
+	for (const auto &filter : filters) {
+		TryPushExpression(get, *filter, bind.pushdown);
+	}
+	if (bind.pushdown.has_lower_bound_seconds && bind.pushdown.has_upper_bound_seconds &&
+	    bind.pushdown.lower_bound_seconds > bind.pushdown.upper_bound_seconds) {
+		bind.pushdown.empty_result = true;
+	}
+	// Deliberately leave every expression in `filters`. DuckDB retains a residual filter above the
+	// scan, guaranteeing exact SQL semantics even where the Logging query language is broader (it
+	// compares timestamps at whole-second granularity here, and severity matching is by enum name).
+}
+
+//===--------------------------------------------------------------------===//
+// Bind / init / scan
+//===--------------------------------------------------------------------===//
+
+//! Apply resolved credentials to `bind`. Shared by the table function and the catalog tables so
+//! both honor the same secret, endpoint, and quota-project rules.
+static void ApplyCredentials(GcloudLogsBindData &bind, const GcloudCredentials &credentials) {
+	bind.client.endpoint = GcloudLoggingEndpoint(credentials);
+	bind.client.insecure_tls = credentials.insecure_tls;
+	bind.client.auth.token = credentials.token;
+	bind.client.auth.credentials_file = credentials.credentials_file;
+	bind.client.auth.quota_project = credentials.quota_project;
+	bind.client.auth.insecure_tls = credentials.insecure_tls;
+	bind.client.auth.timeout_seconds = bind.client.timeout_seconds;
+}
+
+//! Turn a project id into the single resource name entries.list expects, throwing the guidance
+//! message when nothing supplied one.
+static vector<string> ResolveResourceNames(const string &project, const GcloudCredentials &credentials) {
+	auto resolved = project.empty() ? credentials.project : project;
+	if (resolved.empty()) {
+		resolved = TryDiscoverAdcProject();
+	}
+	if (resolved.empty()) {
+		throw InvalidInputException("read_gcloud_logs: no Google Cloud project configured. Pass one explicitly:\n"
+		                            "  SELECT * FROM read_gcloud_logs(project => 'my-project');\n"
+		                            "or store it in a secret:\n"
+		                            "  CREATE SECRET (TYPE gcloud, PROJECT 'my-project');\n"
+		                            "or set one for the gcloud CLI:\n"
+		                            "  gcloud auth application-default set-quota-project my-project");
+	}
+	return {"projects/" + resolved};
+}
+
 static unique_ptr<FunctionData> GcloudLogsBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<GcloudLogsBindData>();
+	GcloudLogsSettings settings;
 	string secret_name;
 	string project;
 	string start_time;
@@ -895,86 +926,57 @@ static unique_ptr<FunctionData> GcloudLogsBind(ClientContext &context, TableFunc
 		} else if (key == "filter") {
 			result->filter = param.second.ToString();
 		} else if (key == "order_by") {
-			result->order_by = param.second.ToString();
+			settings.order_by = param.second.ToString();
 		} else if (key == "start_time") {
 			start_time = param.second.ToString();
 		} else if (key == "end_time") {
 			end_time = param.second.ToString();
 		} else if (key == "max_rows") {
-			result->max_rows = param.second.GetValue<int64_t>();
+			settings.max_rows = param.second.GetValue<int64_t>();
 		} else if (key == "page_size") {
-			result->page_size = param.second.GetValue<int64_t>();
+			settings.page_size = param.second.GetValue<int64_t>();
 		} else if (key == "retries") {
-			auto retries = param.second.GetValue<int64_t>();
-			if (retries < 0) {
-				throw InvalidInputException("read_gcloud_logs: retries must be >= 0 (0 disables retrying)");
-			}
-			result->client.retries = static_cast<uint64_t>(retries);
+			settings.retries = param.second.GetValue<int64_t>();
 		} else if (key == "timeout") {
-			auto timeout = param.second.GetValue<int64_t>();
-			if (timeout < 1) {
-				throw InvalidInputException("read_gcloud_logs: timeout must be >= 1 (seconds)");
-			}
-			result->client.timeout_seconds = static_cast<uint64_t>(timeout);
+			settings.timeout_seconds = param.second.GetValue<int64_t>();
 		} else if (key == "secret") {
 			secret_name = param.second.ToString();
 		}
 	}
 
-	if (result->max_rows < 0) {
-		throw InvalidInputException("read_gcloud_logs: max_rows must be >= 0 (0 means unlimited)");
-	}
-	if (result->page_size < 1 || result->page_size > 1000) {
-		throw InvalidInputException("read_gcloud_logs: page_size must be between 1 and 1000");
-	}
-	// entries.list rejects anything else, and silently sorting the wrong way is worse than failing.
-	if (!StringUtil::CIEquals(result->order_by, "timestamp desc") &&
-	    !StringUtil::CIEquals(result->order_by, "timestamp asc")) {
-		throw InvalidInputException("read_gcloud_logs: order_by must be 'timestamp desc' or 'timestamp asc' (got '%s')",
-		                            result->order_by);
-	}
+	// Validation runs before credential resolution so the offline tests hit these errors whether or
+	// not the host has Application Default Credentials configured.
+	ValidateGcloudLogsSettings(settings, "read_gcloud_logs");
+	result->order_by = settings.order_by;
+	result->max_rows = settings.max_rows;
+	result->page_size = settings.page_size;
+	result->client.retries = static_cast<uint64_t>(settings.retries);
+	result->client.timeout_seconds = static_cast<uint64_t>(settings.timeout_seconds);
 
 	auto credentials = GetGcloudCredentials(context, secret_name);
-	result->client.endpoint = GcloudLoggingEndpoint(credentials);
-	result->client.insecure_tls = credentials.insecure_tls;
-	result->client.auth.token = credentials.token;
-	result->client.auth.credentials_file = credentials.credentials_file;
-	result->client.auth.quota_project = credentials.quota_project;
-	result->client.auth.insecure_tls = credentials.insecure_tls;
-	result->client.auth.timeout_seconds = result->client.timeout_seconds;
+	ApplyCredentials(*result, credentials);
 
 	// `resource_names` is the API's own parameter and wins; `project` is the ergonomic shorthand for
 	// the overwhelmingly common single-project case.
 	if (!resource_names.empty()) {
 		result->resource_names = std::move(resource_names);
 	} else {
-		if (project.empty()) {
-			project = credentials.project;
-		}
-		if (project.empty()) {
-			project = TryDiscoverAdcProject();
-		}
-		if (project.empty()) {
-			throw InvalidInputException("read_gcloud_logs: no Google Cloud project configured. Pass one explicitly:\n"
-			                            "  SELECT * FROM read_gcloud_logs(project => 'my-project');\n"
-			                            "or store it in a secret:\n"
-			                            "  CREATE SECRET (TYPE gcloud, PROJECT 'my-project');\n"
-			                            "or set one for the gcloud CLI:\n"
-			                            "  gcloud auth application-default set-quota-project my-project");
-		}
-		result->resource_names = {"projects/" + project};
+		result->resource_names = ResolveResourceNames(project, credentials);
 	}
 
-	result->filter = BuildFilter(result->filter, start_time, end_time);
+	result->filter = BuildGcloudFilter(result->filter, start_time, end_time);
 
-	GetLogsSchema(return_types, names);
+	GetGcloudLogsSchema(return_types, names);
 	return std::move(result);
 }
 
-static unique_ptr<GlobalTableFunctionState> GcloudLogsInitGlobal(ClientContext &context,
-                                                                 TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> GcloudLogsInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 	auto state = make_uniq<GcloudLogsGlobalState>();
+	auto &bind = input.bind_data->Cast<GcloudLogsBindData>();
 	state->column_ids = input.column_ids;
+	state->request_filter = ApplyGcloudPushdown(bind.filter, bind.pushdown);
+	// Contradictory bounds (e.g. ts > x AND ts < y with x > y) can never match; skip the request.
+	state->finished = bind.pushdown.empty_result;
 	return std::move(state);
 }
 
@@ -982,7 +984,7 @@ static void GcloudLogsScan(ClientContext &context, TableFunctionInput &data_p, D
 	auto &bind = data_p.bind_data->Cast<GcloudLogsBindData>();
 	auto &state = data_p.global_state->Cast<GcloudLogsGlobalState>();
 
-	if (bind.max_rows > 0 && state.total_emitted >= static_cast<idx_t>(bind.max_rows)) {
+	if (GcloudLogsMaxRowsReached(bind.max_rows, state.total_emitted)) {
 		// Row cap already reached — stop before issuing another request.
 		state.finished = true;
 		state.buffer.clear();
@@ -996,11 +998,6 @@ static void GcloudLogsScan(ClientContext &context, TableFunctionInput &data_p, D
 
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE && !state.buffer.empty()) {
-		if (bind.max_rows > 0 && state.total_emitted >= static_cast<idx_t>(bind.max_rows)) {
-			state.finished = true;
-			state.buffer.clear();
-			break;
-		}
 		auto &row = state.buffer.front();
 		for (idx_t col = 0; col < row.size(); col++) {
 			output.SetValue(col, count, row[col]);
@@ -1008,9 +1005,51 @@ static void GcloudLogsScan(ClientContext &context, TableFunctionInput &data_p, D
 		state.buffer.pop_front();
 		count++;
 		state.total_emitted++;
+		if (GcloudLogsMaxRowsReached(bind.max_rows, state.total_emitted)) {
+			state.finished = true;
+			state.buffer.clear();
+			break;
+		}
 	}
 
 	output.SetCardinality(count);
+}
+
+//! EXPLAIN detail. Shows the filter actually sent to Cloud Logging, so a user can see exactly which
+//! predicates were pushed and which stayed local.
+static InsertionOrderPreservingMap<string> GcloudLogsToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	auto &bind = input.bind_data->Cast<GcloudLogsBindData>();
+	result["Function"] = input.table_function.name;
+	result["Google Cloud Resources"] = StringUtil::Join(bind.resource_names, ", ");
+	auto request_filter = ApplyGcloudPushdown(bind.filter, bind.pushdown);
+	if (!request_filter.empty()) {
+		result["Google Cloud Filter"] = request_filter;
+	}
+	if (bind.pushdown.empty_result) {
+		result["Google Cloud Filter"] = "(contradictory time bounds — no request is issued)";
+	}
+	result["Google Cloud Order By"] = bind.order_by;
+	result["Google Cloud Page Size"] = std::to_string(bind.page_size);
+	result["Google Cloud Max Rows"] = std::to_string(bind.max_rows);
+	result["Google Cloud Retries"] = std::to_string(bind.client.retries);
+	result["Google Cloud Timeout"] = std::to_string(bind.client.timeout_seconds);
+	return result;
+}
+
+static BindInfo GcloudLogsGetBindInfo(const optional_ptr<FunctionData> bind_data) {
+	auto &bind = bind_data->Cast<GcloudLogsBindData>();
+	D_ASSERT(bind.table);
+	return BindInfo(*bind.table);
+}
+
+//! Wire up the parts shared by read_gcloud_logs and the catalog-backed table.
+static void ConfigureLogsScan(TableFunction &function) {
+	// Only projected columns are mapped from the response; a count(*) or GROUP BY service_name never
+	// pays the per-row log_attributes JSON serialization.
+	function.projection_pushdown = true;
+	function.pushdown_complex_filter = GcloudLogsPushdownComplexFilter;
+	function.to_string = GcloudLogsToString;
 }
 
 void RegisterGcloudLogsFunction(ExtensionLoader &loader) {
@@ -1026,10 +1065,31 @@ void RegisterGcloudLogsFunction(ExtensionLoader &loader) {
 	function.named_parameters["retries"] = LogicalType::BIGINT;
 	function.named_parameters["timeout"] = LogicalType::BIGINT;
 	function.named_parameters["secret"] = LogicalType::VARCHAR;
-	// Only projected columns are mapped from the response; a count(*) or GROUP BY service_name never
-	// pays the per-row log_attributes JSON serialization.
-	function.projection_pushdown = true;
+	ConfigureLogsScan(function);
 	loader.RegisterFunction(function);
+}
+
+TableFunction GetGcloudLogsTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
+                                     const string &project, const GcloudLogsSettings &settings,
+                                     unique_ptr<FunctionData> &bind_data) {
+	auto result = make_uniq<GcloudLogsBindData>();
+	result->table = &table;
+	result->order_by = settings.order_by;
+	result->max_rows = settings.max_rows;
+	result->page_size = settings.page_size;
+	result->client.retries = static_cast<uint64_t>(settings.retries);
+	result->client.timeout_seconds = static_cast<uint64_t>(settings.timeout_seconds);
+
+	auto credentials = GetGcloudCredentials(context, secret_name);
+	ApplyCredentials(*result, credentials);
+	result->resource_names = ResolveResourceNames(project, credentials);
+	result->filter = BuildGcloudFilter(settings.filter, settings.start_time, settings.end_time);
+	bind_data = std::move(result);
+
+	TableFunction function("gcloud_logs_scan", {}, GcloudLogsScan, nullptr, GcloudLogsInitGlobal);
+	ConfigureLogsScan(function);
+	function.get_bind_info = GcloudLogsGetBindInfo;
+	return function;
 }
 
 } // namespace duckdb
