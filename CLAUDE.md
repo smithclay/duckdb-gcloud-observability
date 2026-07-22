@@ -78,12 +78,17 @@ Source files under `src/` (+ headers in `src/include/`):
 - `gcloud_observability_extension.cpp` — entry point; registers the secret type, the catalog, and the
   table function.
 - `gcloud_secret.cpp` — the `gcloud` KeyValueSecret (`PROJECT`, `TOKEN`, `CREDENTIALS`,
-  `QUOTA_PROJECT`, `UNIVERSE_DOMAIN`, `ENDPOINT`, `INSECURE_TLS`). `TOKEN` is redacted;
+  `QUOTA_PROJECT`, `UNIVERSE_DOMAIN`, `ENDPOINT`, `MONITORING_ENDPOINT`, `INSECURE_TLS`). The two
+  endpoint overrides are separate because Logging and Monitoring are different hosts, so one cannot
+  stand in for both. `TOKEN` is redacted;
   `CREDENTIALS` is only a path, so it stays visible.
 - `gcloud_auth.cpp` — Application Default Credentials discovery and the OAuth2 token exchange.
-- `gcloud_client.cpp` — `GcloudClient`: one keep-alive httplib connection, `POST /v2/entries:list`,
-  and the retry loop (429/5xx/transport, exponential backoff, ~100ms-granular cancellation via
-  `context.interrupted`).
+  `GcloudAuthConfig::scope` selects `logging.read` vs `monitoring.read`, and is part of the token
+  cache key so the two coexist rather than one widening the other.
+- `gcloud_client.cpp` — `GcloudClient`: one keep-alive httplib connection and a generic
+  `Request(method, path, ...)` (GET and POST, so the Logging and Monitoring readers share one path),
+  plus the retry loop (429/5xx/transport, exponential backoff, ~100ms-granular cancellation via
+  `context.interrupted`, and a single 401 token re-mint).
 - `logs_table.cpp` — the bulk. The LogEntry→OTLP mapping, the scan/pagination loop, and the
   conservative WHERE pushdown.
 - `gcloud_json.cpp` — *pure* request building and response parsing (no network, no catalog, no
