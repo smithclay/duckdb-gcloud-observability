@@ -574,8 +574,8 @@ static void FetchNextPage(ClientContext &context, const GcloudLogsBindData &bind
 		return;
 	}
 
-	auto body = BuildGcloudListBody(bind.resource_names, state.request_filter, bind.order_by, page_size,
-	                                state.page_token);
+	auto body =
+	    BuildGcloudListBody(bind.resource_names, state.request_filter, bind.order_by, page_size, state.page_token);
 	auto response = bind.client.ListEntries(context, body);
 
 	YyjsonDocPtr doc(yyjson_read(response.c_str(), response.size(), 0));

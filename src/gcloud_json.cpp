@@ -115,8 +115,8 @@ string ResolveTimeSpec(const string &parameter, const string &spec) {
 
 bool IsLogSeverityName(const string &name) {
 	// Cloud Logging's LogSeverity is a fixed nine-value enum, not a freeform level string.
-	static const char *const kNames[] = {"DEFAULT", "DEBUG",    "INFO",     "NOTICE",   "WARNING",
-	                                     "ERROR",   "CRITICAL", "ALERT",    "EMERGENCY"};
+	static const char *const kNames[] = {"DEFAULT", "DEBUG",    "INFO",  "NOTICE",   "WARNING",
+	                                     "ERROR",   "CRITICAL", "ALERT", "EMERGENCY"};
 	for (const char *candidate : kNames) {
 		if (name == candidate) {
 			return true;
@@ -416,10 +416,12 @@ GcloudAlertPoliciesPage ParseGcloudAlertPoliciesPage(const string &response_json
 				}
 			}
 			if (yyjson_val *record = GcloudLookupObj(item, "creationRecord", "creation_record")) {
-				policy.has_created_at = ReadTimestampField(record, "mutateTime", "mutate_time", policy.created_at_nanos);
+				policy.has_created_at =
+				    ReadTimestampField(record, "mutateTime", "mutate_time", policy.created_at_nanos);
 			}
 			if (yyjson_val *record = GcloudLookupObj(item, "mutationRecord", "mutation_record")) {
-				policy.has_updated_at = ReadTimestampField(record, "mutateTime", "mutate_time", policy.updated_at_nanos);
+				policy.has_updated_at =
+				    ReadTimestampField(record, "mutateTime", "mutate_time", policy.updated_at_nanos);
 			}
 			page.policies.push_back(std::move(policy));
 		}

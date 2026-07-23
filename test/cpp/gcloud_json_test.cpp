@@ -71,8 +71,7 @@ int main() {
 		Require(origin == "https://logging.googleapis.com" && prefix.empty(),
 		        "a bare API host should yield no path prefix");
 		SplitGcloudEndpoint("https://logging.googleapis.com/", origin, prefix);
-		Require(origin == "https://logging.googleapis.com" && prefix.empty(),
-		        "a trailing slash is not a path prefix");
+		Require(origin == "https://logging.googleapis.com" && prefix.empty(), "a trailing slash is not a path prefix");
 		SplitGcloudEndpoint("https://lab.example.com/api/gcloud/logging", origin, prefix);
 		Require(origin == "https://lab.example.com" && prefix == "/api/gcloud/logging",
 		        "a proxy route should split into origin and prefix so request paths append to it");

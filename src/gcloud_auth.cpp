@@ -260,9 +260,9 @@ static string BuildServiceAccountAssertion(const string &client_email, const str
 	int64_t expires_at = issued_at + 3600; // Google caps assertion lifetime at 1 hour.
 
 	string header = R"({"alg":"RS256","typ":"JWT"})";
-	string claims = StringUtil::Format(R"({"iss":"%s","scope":"%s","aud":"%s","exp":%lld,"iat":%lld})", client_email,
-	                                   scope, token_uri, static_cast<long long>(expires_at),
-	                                   static_cast<long long>(issued_at));
+	string claims =
+	    StringUtil::Format(R"({"iss":"%s","scope":"%s","aud":"%s","exp":%lld,"iat":%lld})", client_email, scope,
+	                       token_uri, static_cast<long long>(expires_at), static_cast<long long>(issued_at));
 
 	string signing_input = Base64UrlEncode(header) + "." + Base64UrlEncode(claims);
 	return signing_input + "." + SignRs256(private_key_pem, signing_input);

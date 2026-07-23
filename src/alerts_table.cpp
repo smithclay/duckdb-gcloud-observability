@@ -348,22 +348,29 @@ static TableFunction MakeAlertsFunction(const char *name) {
 } // namespace
 
 void GetGcloudOpenAlertsSchema(vector<LogicalType> &types, vector<string> &names) {
-	names = {"incident_id", "policy_id",     "policy_name",     "state",    "summary",
-	         "resource_type", "resource_labels", "opened_at", "closed_at"};
-	types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,   LogicalType::TIMESTAMP, LogicalType::TIMESTAMP};
+	names = {"incident_id",   "policy_id",       "policy_name", "state",    "summary",
+	         "resource_type", "resource_labels", "opened_at",   "closed_at"};
+	types = {LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::VARCHAR,
+	         LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::VARCHAR,
+	         LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::TIMESTAMP};
 	D_ASSERT(names.size() == ALERT_COLUMN_COUNT && types.size() == ALERT_COLUMN_COUNT);
 }
 
 void GetGcloudAlertPoliciesSchema(vector<LogicalType> &types, vector<string> &names) {
-	names = {"policy_id",   "display_name",          "enabled",     "severity",
-	         "combiner",    "condition_count",       "notification_channels", "user_labels",
-	         "documentation", "created_at",          "updated_at"};
-	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
-	         LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
-	         LogicalType::LIST(LogicalType::VARCHAR),    LogicalType::VARCHAR,
-	         LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::TIMESTAMP};
+	names = {"policy_id",       "display_name",          "enabled",     "severity",      "combiner",
+	         "condition_count", "notification_channels", "user_labels", "documentation", "created_at",
+	         "updated_at"};
+	types = {LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::BOOLEAN,
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::INTEGER,
+	         LogicalType::LIST(LogicalType::VARCHAR),
+	         LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,
+	         LogicalType::TIMESTAMP,
+	         LogicalType::TIMESTAMP};
 	D_ASSERT(names.size() == POLICY_COLUMN_COUNT && types.size() == POLICY_COLUMN_COUNT);
 }
 

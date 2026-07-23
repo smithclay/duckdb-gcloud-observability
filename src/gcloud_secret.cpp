@@ -145,8 +145,7 @@ string GcloudMonitoringEndpoint(const GcloudCredentials &credentials) {
 	if (!credentials.monitoring_endpoint.empty()) {
 		return NormalizeEndpoint(credentials.monitoring_endpoint, "https://monitoring.googleapis.com");
 	}
-	return NormalizeEndpoint("https://monitoring." + credentials.universe_domain,
-	                         "https://monitoring.googleapis.com");
+	return NormalizeEndpoint("https://monitoring." + credentials.universe_domain, "https://monitoring.googleapis.com");
 }
 
 } // namespace duckdb
