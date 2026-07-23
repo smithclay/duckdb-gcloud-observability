@@ -80,15 +80,17 @@ GEN=ninja make
 ## Running the extension
 To run the extension code, simply start the shell with `./build/release/duckdb`. This shell will have the extension pre-loaded.  
 
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `waddle()` that takes a string arguments and returns a string:
+Now we can use the features from the extension directly in DuckDB. This extension provides the
+`read_gcloud_logs()` table function; see the [top-level README](../README.md) for its parameters.
 ```
-D select waddle('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ Quack Jane 🐥 │
-└───────────────┘
+D select severity_text, count(*) from read_gcloud_logs(project => 'my-project', start_time => '-1h') group by 1;
+┌───────────────┬──────────────┐
+│ severity_text │ count_star() │
+│    varchar    │    int64     │
+├───────────────┼──────────────┤
+│ INFO          │          412 │
+│ ERROR         │            3 │
+└───────────────┴──────────────┘
 ```
 
 ## Running the tests
