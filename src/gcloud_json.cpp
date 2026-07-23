@@ -4,12 +4,13 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -49,12 +50,15 @@ bool ParseRfc3339ToNanos(const char *str, int64_t &out_nanos) {
 }
 
 string FormatRfc3339(int64_t epoch_seconds) {
-	std::time_t as_time = static_cast<std::time_t>(epoch_seconds);
-	struct tm utc;
-	gmtime_r(&as_time, &utc);
-	char buffer[32];
-	strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc);
-	return string(buffer);
+	// DuckDB's own conversion instead of gmtime_r/strftime: gmtime_r does not exist on MSVC.
+	date_t date;
+	dtime_t time;
+	Timestamp::Convert(Timestamp::FromEpochSeconds(epoch_seconds), date, time);
+	int32_t year, month, day;
+	Date::Convert(date, year, month, day);
+	int32_t hour, minute, second, micros;
+	Time::Convert(time, hour, minute, second, micros);
+	return StringUtil::Format("%04d-%02d-%02dT%02d:%02d:%02dZ", year, month, day, hour, minute, second);
 }
 
 string ResolveTimeSpec(const string &parameter, const string &spec) {
