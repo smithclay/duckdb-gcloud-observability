@@ -63,7 +63,9 @@ if(NOT EMSCRIPTEN)
   target_include_directories(
     gcloud_json_test PRIVATE src/include
                              "${GCLOUD_DUCKDB_DIR}/third_party/yyjson/include")
-  target_link_libraries(gcloud_json_test dummy_static_extension_loader duckdb_static)
+  # Keep DuckDB before the dummy extension loader: GNU ld resolves static
+  # archives left-to-right, and duckdb_static introduces loader references.
+  target_link_libraries(gcloud_json_test duckdb_static dummy_static_extension_loader)
   set_target_properties(
     gcloud_json_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                 "${CMAKE_BINARY_DIR}/extension/gcloud_observability")
