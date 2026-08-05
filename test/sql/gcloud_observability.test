@@ -255,7 +255,17 @@ SELECT count(*) FROM (DESCRIBE SELECT * FROM gcp.logs.entries);
 query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM gcp.alerts.open);
 ----
-9
+17
+
+# Existing columns remain in their original positions and the current v3 Alert metadata is exposed.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM gcp.alerts.open)
+WHERE column_name IN ('incident_id', 'policy_id', 'policy_name', 'state', 'summary', 'resource_type',
+                      'resource_labels', 'opened_at', 'closed_at', 'alert_name', 'policy_severity',
+                      'policy_user_labels', 'resource_system_labels', 'resource_user_labels',
+                      'metric_type', 'metric_labels', 'log_extracted_labels');
+----
+17
 
 query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM gcp.alerts.policies);
@@ -272,7 +282,7 @@ physical_plan	<REGEX>:.*severity = ..ALERT.*
 query II
 EXPLAIN (FORMAT JSON) SELECT incident_id, state FROM gcp.alerts.open;
 ----
-physical_plan	<REGEX>:.*state=open.*
+physical_plan	<REGEX>:.*state=OPEN.*
 
 # The catalog is read-only.
 statement error

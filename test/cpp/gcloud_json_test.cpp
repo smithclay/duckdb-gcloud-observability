@@ -102,13 +102,24 @@ int main() {
 		Require(!GcloudLogsMaxRowsReached(0, 1000000), "max_rows = 0 means unlimited");
 		Require(GcloudLogsMaxRowsReached(10, 10), "the cap is reached once max_rows rows are emitted");
 
+		unordered_set<string> seen_page_tokens;
+		string page_token;
+		Require(AdvanceGcloudPageToken("A", seen_page_tokens, page_token) && page_token == "A",
+		        "the first cursor should advance pagination");
+		Require(AdvanceGcloudPageToken("B", seen_page_tokens, page_token) && page_token == "B",
+		        "a new cursor should advance pagination");
+		Require(!AdvanceGcloudPageToken("A", seen_page_tokens, page_token) && page_token == "B",
+		        "a non-adjacent cursor cycle should stop without replacing the current cursor");
+		Require(!AdvanceGcloudPageToken("", seen_page_tokens, page_token),
+		        "an empty cursor should mark pagination exhausted");
+
 		//===------------------------------------------------------------===//
 		// Cloud Monitoring paths
 		//===------------------------------------------------------------===//
 		Require(PercentEncode("state=open") == "state%3Dopen", "reserved characters should be percent-encoded");
 		Require(PercentEncode("a-b_c.d~e") == "a-b_c.d~e", "unreserved characters should pass through");
 		Require(BuildGcloudOpenAlertsPath("my-project", 100, "") ==
-		            "/v3/projects/my-project/alerts?filter=state%3Dopen&pageSize=100",
+		            "/v3/projects/my-project/alerts?filter=state%3DOPEN&pageSize=100",
 		        "the incident listing should filter server-side to open alerts");
 		Require(BuildGcloudOpenAlertsPath("p", 50, "tok/en").find("&pageToken=tok%2Fen") != string::npos,
 		        "a page token must be percent-encoded into the query string");
@@ -121,10 +132,14 @@ int main() {
 		//===------------------------------------------------------------===//
 		auto alerts = ParseGcloudAlertsPage(R"({
 			"alerts":[
-				{"name":"projects/p/alerts/0.abc123","state":"open","openTime":"2026-07-20T10:00:00Z",
+				{"name":"projects/p/alerts/0.abc123","state":"OPEN","openTime":"2026-07-20T10:00:00Z",
 				 "summaryText":"CPU high","resource":{"type":"gce_instance","labels":{"instance_id":"42"}},
-				 "policy":{"name":"projects/p/alertPolicies/9","displayName":"CPU"}},
-				{"name":"projects/p/alerts/0.def456","state":"closed"}
+				 "metadata":{"systemLabels":{"name":"vm-1","spot":false},"userLabels":{"team":"infra"}},
+				 "metric":{"type":"compute.googleapis.com/instance/cpu/utilization","labels":{"zone":"us-west1-a"}},
+				 "log":{"extractedLabels":{"request_id":"abc"}},
+				 "policy":{"name":"projects/p/alertPolicies/9","displayName":"CPU","severity":"WARNING",
+				           "userLabels":{"owner":"platform"}}},
+				{"name":"projects/p/alerts/0.def456","state":"CLOSED"}
 			],
 			"nextPageToken":"next"
 		})");
@@ -132,10 +147,27 @@ int main() {
 		Require(alerts.next_page_token == "next", "the cursor should be retained");
 		Require(alerts.alerts[0].has_incident_id && alerts.alerts[0].incident_id == "0.abc123",
 		        "the incident id should be the last path segment of the resource name");
+		Require(alerts.alerts[0].has_alert_name && alerts.alerts[0].alert_name == "projects/p/alerts/0.abc123",
+		        "the full v3 alert resource name should be retained");
 		Require(alerts.alerts[0].has_policy_name && alerts.alerts[0].policy_name == "CPU",
 		        "the policy display name should be parsed");
 		Require(alerts.alerts[0].resource_labels == R"({"instance_id":"42"})",
 		        "resource labels should be preserved as serialized JSON");
+		Require(alerts.alerts[0].resource_system_labels == R"({"name":"vm-1","spot":false})",
+		        "system resource metadata should be preserved as serialized JSON");
+		Require(alerts.alerts[0].resource_user_labels == R"({"team":"infra"})",
+		        "user resource metadata should be preserved as serialized JSON");
+		Require(alerts.alerts[0].has_metric_type &&
+		            alerts.alerts[0].metric_type == "compute.googleapis.com/instance/cpu/utilization",
+		        "the metric type should be parsed");
+		Require(alerts.alerts[0].metric_labels == R"({"zone":"us-west1-a"})",
+		        "metric labels should be preserved as serialized JSON");
+		Require(alerts.alerts[0].log_extracted_labels == R"({"request_id":"abc"})",
+		        "log-alert extracted labels should be preserved as serialized JSON");
+		Require(alerts.alerts[0].has_policy_severity && alerts.alerts[0].policy_severity == "WARNING",
+		        "the policy snapshot severity should be parsed");
+		Require(alerts.alerts[0].policy_user_labels == R"({"owner":"platform"})",
+		        "policy snapshot labels should be preserved as serialized JSON");
 		Require(alerts.alerts[0].has_opened_at, "openTime should parse");
 		Require(!alerts.alerts[0].has_closed_at, "a missing closeTime should preserve SQL NULL semantics");
 		Require(alerts.alerts[1].resource_labels.empty(),

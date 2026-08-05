@@ -30,7 +30,17 @@ static constexpr idx_t COL_ALERT_RESOURCE_TYPE = 5;
 static constexpr idx_t COL_ALERT_RESOURCE_LABELS = 6;
 static constexpr idx_t COL_ALERT_OPENED_AT = 7;
 static constexpr idx_t COL_ALERT_CLOSED_AT = 8;
-static constexpr idx_t ALERT_COLUMN_COUNT = 9;
+// Appended after the original Preview-era columns so existing SELECT * consumers retain the same
+// leading column order while the documented v3 Alert resource is represented completely.
+static constexpr idx_t COL_ALERT_NAME = 9;
+static constexpr idx_t COL_ALERT_POLICY_SEVERITY = 10;
+static constexpr idx_t COL_ALERT_POLICY_USER_LABELS = 11;
+static constexpr idx_t COL_ALERT_RESOURCE_SYSTEM_LABELS = 12;
+static constexpr idx_t COL_ALERT_RESOURCE_USER_LABELS = 13;
+static constexpr idx_t COL_ALERT_METRIC_TYPE = 14;
+static constexpr idx_t COL_ALERT_METRIC_LABELS = 15;
+static constexpr idx_t COL_ALERT_LOG_EXTRACTED_LABELS = 16;
+static constexpr idx_t ALERT_COLUMN_COUNT = 17;
 
 //===--------------------------------------------------------------------===//
 // alerts.policies
@@ -67,8 +77,7 @@ struct GcloudAlertsGlobalState : public GlobalTableFunctionState {
 	vector<column_t> column_ids;
 	std::deque<vector<Value>> buffer;
 	string page_token;
-	//! Distinguishes "no cursor yet, fetch the first page" from "cursor exhausted".
-	bool first_page = true;
+	unordered_set<string> seen_page_tokens;
 	idx_t total_emitted = 0;
 	bool finished = false;
 
@@ -136,6 +145,30 @@ static void MapAlert(const GcloudAlert &alert, const vector<column_t> &column_id
 		case COL_ALERT_CLOSED_AT:
 			row[c] = TimestampFromNanos(alert.has_closed_at, alert.closed_at_nanos);
 			break;
+		case COL_ALERT_NAME:
+			row[c] = OptionalString(alert.has_alert_name, alert.alert_name);
+			break;
+		case COL_ALERT_POLICY_SEVERITY:
+			row[c] = OptionalString(alert.has_policy_severity, alert.policy_severity);
+			break;
+		case COL_ALERT_POLICY_USER_LABELS:
+			row[c] = OptionalJson(alert.policy_user_labels);
+			break;
+		case COL_ALERT_RESOURCE_SYSTEM_LABELS:
+			row[c] = OptionalJson(alert.resource_system_labels);
+			break;
+		case COL_ALERT_RESOURCE_USER_LABELS:
+			row[c] = OptionalJson(alert.resource_user_labels);
+			break;
+		case COL_ALERT_METRIC_TYPE:
+			row[c] = OptionalString(alert.has_metric_type, alert.metric_type);
+			break;
+		case COL_ALERT_METRIC_LABELS:
+			row[c] = OptionalJson(alert.metric_labels);
+			break;
+		case COL_ALERT_LOG_EXTRACTED_LABELS:
+			row[c] = OptionalJson(alert.log_extracted_labels);
+			break;
 		default:
 			// Virtual columns such as the count(*) row-id sentinel stay NULL.
 			break;
@@ -196,7 +229,8 @@ static void MapPolicy(const GcloudAlertPolicy &policy, const vector<column_t> &c
 //!
 //! Like entries.list, termination keys off the page token alone rather than an empty result array:
 //! a filtered listing can legitimately return a page with no matches and still hand back a cursor.
-//! A server echoing a non-advancing cursor would otherwise spin forever, so that ends the scan too.
+//! A server repeating any cursor would otherwise spin forever, so the scan remembers every token
+//! instead of guarding only the immediate A -> A case.
 static void FetchNextPage(ClientContext &context, const GcloudAlertsBindData &bind, GcloudAlertsGlobalState &state) {
 	auto accounted = state.total_emitted + state.buffer.size();
 	auto page_size = GetGcloudLogsPageSize(bind.page_size, bind.max_rows, accounted);
@@ -210,7 +244,7 @@ static void FetchNextPage(ClientContext &context, const GcloudAlertsBindData &bi
 		auto path = BuildGcloudOpenAlertsPath(bind.project, page_size, state.page_token);
 		auto page = ParseGcloudAlertsPage(bind.client.Get(context, path, kMonitoringApiName));
 		for (const auto &alert : page.alerts) {
-			// The request already filters to state=open; this preserves the table's contract if an
+			// The request already filters to state=OPEN; this preserves the table's contract if an
 			// incident resolves concurrently with pagination.
 			if (alert.has_state && !StringUtil::CIEquals(alert.state, "open")) {
 				continue;
@@ -231,12 +265,9 @@ static void FetchNextPage(ClientContext &context, const GcloudAlertsBindData &bi
 		next_token = std::move(page.next_page_token);
 	}
 
-	if (next_token.empty() || (!state.first_page && next_token == state.page_token)) {
+	if (!AdvanceGcloudPageToken(next_token, state.seen_page_tokens, state.page_token)) {
 		state.finished = true;
-	} else {
-		state.page_token = std::move(next_token);
 	}
-	state.first_page = false;
 }
 
 static unique_ptr<GlobalTableFunctionState> GcloudAlertsInitGlobal(ClientContext &, TableFunctionInitInput &input) {
@@ -290,7 +321,7 @@ static InsertionOrderPreservingMap<string> GcloudAlertsToString(TableFunctionToS
 	result["Google Cloud Project"] = bind.project;
 	result["Google Cloud Endpoint"] = bind.client.endpoint;
 	if (bind.kind == AlertsKind::OPEN_INCIDENTS) {
-		result["Google Cloud Filter"] = "state=open";
+		result["Google Cloud Filter"] = "state=OPEN";
 	}
 	result["Google Cloud Page Size"] = std::to_string(bind.page_size);
 	result["Google Cloud Max Rows"] = std::to_string(bind.max_rows);
@@ -348,11 +379,28 @@ static TableFunction MakeAlertsFunction(const char *name) {
 } // namespace
 
 void GetGcloudOpenAlertsSchema(vector<LogicalType> &types, vector<string> &names) {
-	names = {"incident_id",   "policy_id",       "policy_name", "state",    "summary",
-	         "resource_type", "resource_labels", "opened_at",   "closed_at"};
-	types = {LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::VARCHAR,
-	         LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::VARCHAR,
-	         LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::TIMESTAMP};
+	names = {"incident_id",
+	         "policy_id",
+	         "policy_name",
+	         "state",
+	         "summary",
+	         "resource_type",
+	         "resource_labels",
+	         "opened_at",
+	         "closed_at",
+	         "alert_name",
+	         "policy_severity",
+	         "policy_user_labels",
+	         "resource_system_labels",
+	         "resource_user_labels",
+	         "metric_type",
+	         "metric_labels",
+	         "log_extracted_labels"};
+	types = {LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
+	         LogicalType::TIMESTAMP, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	         LogicalType::VARCHAR};
 	D_ASSERT(names.size() == ALERT_COLUMN_COUNT && types.size() == ALERT_COLUMN_COUNT);
 }
 

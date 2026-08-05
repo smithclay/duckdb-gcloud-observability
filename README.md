@@ -44,7 +44,8 @@ Both `authorized_user` credentials (refresh-token grant) and `service_account` k
 self-signed JWT assertion) are supported. Tokens are cached in-process and refreshed a minute before
 they expire.
 
-The principal needs `roles/logging.viewer` (or `logging.logEntries.list`) on the project.
+The principal needs `roles/logging.viewer` (or `logging.logEntries.list`) for log queries and
+`roles/monitoring.viewer` for the alert tables.
 
 ### Secrets
 
@@ -147,13 +148,15 @@ ATTACH 'gcloud:' AS gcp (TYPE gcloud, PROJECT 'my-project', START_TIME '-1h', MA
 
 SELECT severity_text, count(*) FROM gcp.logs.entries GROUP BY 1 ORDER BY 2 DESC;
 
-SELECT policy_name, summary, opened_at FROM gcp.alerts.open ORDER BY opened_at DESC;
+SELECT policy_name, policy_severity, metric_type, opened_at
+FROM gcp.alerts.open
+ORDER BY opened_at DESC;
 ```
 
 | Table | Source | Notes |
 |---|---|---|
 | `logs.entries` | `entries.list` | The same 18 columns as `read_gcloud_logs`, and the same pushdown |
-| `alerts.open` | `GET /v3/projects/{p}/alerts?filter=state=open` | Currently-open incidents. **Public Preview API** — see below |
+| `alerts.open` | `projects.alerts.list`, filtered to `state=OPEN` | Currently-open incidents and their resource, metric, log, and policy metadata |
 | `alerts.policies` | `projects.alertPolicies.list` | Alerting policy configuration (GA) |
 
 ATTACH options: `SECRET`, `PROJECT`, `FILTER`, `START_TIME`, `END_TIME`, `ORDER_BY`, `PAGE_SIZE`,
@@ -164,25 +167,26 @@ parameters, so the two interfaces cannot drift. The log settings apply to `logs.
 The secret is resolved at attach time (so a bad name fails immediately) but only its *name* is
 retained, so a later `CREATE OR REPLACE SECRET` is picked up on the next query.
 
-### A note on the alerts APIs
+### Alert metadata
 
-The two alert tables sit on different stability tiers, and that is worth knowing before you build on
-them:
+- **`alerts.policies`** reads [`projects.alertPolicies.list`][policies].
+- **`alerts.open`** reads the documented [`projects.alerts.list`][alerts-list] v3 endpoint with the
+  server-side filter `state=OPEN`. Google currently exposes the matching CLI command under
+  `gcloud beta monitoring alerts list`, so consumers that require only long-stable surfaces should
+  account for that CLI/API maturity signal.
 
-- **`alerts.policies`** reads [`projects.alertPolicies.list`][policies], which is GA and in the v3
-  REST reference.
-- **`alerts.open`** reads `GET https://monitoring.googleapis.com/v3/projects/{project}/alerts`, which
-  is **Public Preview** (subject to the Pre-GA Offerings Terms). It is documented in the [Cloud
-  Logging alerting guide][incidents] rather than the v3 REST reference, and is what
-  `gcloud alpha monitoring alerts list` calls. There is no GA API for listing open incidents. The
-  reader accepts both the `openTime` and `open_time` spellings, since Google's docs and its proto3
-  JSON output disagree on which one this endpoint emits.
+The first nine `alerts.open` columns are retained from the extension's original Preview-era reader.
+The appended columns expose the full documented Alert resource: `alert_name`, policy severity and
+labels, resource system/user labels, metric type/labels, and log-extracted labels. JSON maps remain
+`VARCHAR` so their original structure and unknown keys are preserved. `summary` remains for older
+responses that include `summaryText`; it can be `NULL` because it is not part of the current REST
+resource schema. The reader accepts both lowerCamelCase and snake_case proto JSON spellings.
 
 Both tables need the `monitoring.read` scope, which is requested separately from `logging.read`, so
 a logs-only query never asks for monitoring authority.
 
 [policies]: https://cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.alertPolicies/list
-[incidents]: https://cloud.google.com/logging/docs/alerting/log-based-incidents
+[alerts-list]: https://cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.alerts/list
 
 ## Mapping to OTLP
 

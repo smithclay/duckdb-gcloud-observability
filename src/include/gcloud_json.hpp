@@ -88,6 +88,10 @@ int64_t GetGcloudLogsPageSize(int64_t page_size, int64_t max_rows, idx_t rows_ac
 //! True once a positive `max_rows` cap has been emitted.
 bool GcloudLogsMaxRowsReached(int64_t max_rows, idx_t total_emitted);
 
+//! Advance a cursor only when `next_page_token` is non-empty and has not appeared before. Returns
+//! false at exhaustion or on any token cycle (including A -> B -> A), preventing unbounded scans.
+bool AdvanceGcloudPageToken(const string &next_page_token, unordered_set<string> &seen_page_tokens, string &page_token);
+
 //===--------------------------------------------------------------------===//
 // Cloud Monitoring alerts (incidents)
 //===--------------------------------------------------------------------===//
@@ -95,12 +99,18 @@ bool GcloudLogsMaxRowsReached(int64_t max_rows, idx_t total_emitted);
 //! One incident from the Cloud Monitoring alerts API. Presence flags distinguish a missing/null API
 //! field from a legitimate empty value so scans preserve SQL NULL semantics.
 struct GcloudAlert {
+	bool has_alert_name = false;
+	string alert_name;
 	bool has_incident_id = false;
 	string incident_id;
 	bool has_policy_id = false;
 	string policy_id;
 	bool has_policy_name = false;
 	string policy_name;
+	bool has_policy_severity = false;
+	string policy_severity;
+	//! Serialized JSON object, "" when the policy carries no user labels.
+	string policy_user_labels;
 	bool has_state = false;
 	string state;
 	bool has_summary = false;
@@ -109,6 +119,13 @@ struct GcloudAlert {
 	string resource_type;
 	//! Serialized JSON object, "" when the API sent no labels.
 	string resource_labels;
+	//! Serialized JSON objects from MonitoredResourceMetadata.
+	string resource_system_labels;
+	string resource_user_labels;
+	bool has_metric_type = false;
+	string metric_type;
+	string metric_labels;
+	string log_extracted_labels;
 	bool has_opened_at = false;
 	int64_t opened_at_nanos = 0;
 	bool has_closed_at = false;
@@ -155,8 +172,7 @@ struct GcloudAlertPoliciesPage {
 string PercentEncode(const string &value);
 
 //! Build the path for the open-incident listing:
-//!   GET /v3/projects/{project}/alerts?filter=state%3Dopen&pageSize=N[&pageToken=T]
-//! This endpoint is Public Preview — see the README.
+//!   GET /v3/projects/{project}/alerts?filter=state%3DOPEN&pageSize=N[&pageToken=T]
 string BuildGcloudOpenAlertsPath(const string &project, int64_t page_size, const string &page_token);
 
 //! Build the path for the (GA) alerting-policy listing:
