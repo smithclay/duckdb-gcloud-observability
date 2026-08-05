@@ -27,4 +27,33 @@ jobs:
       duckdb_version: v1.5.5
       ci_tools_version: v1.5-variegata
       extension_name: gcloud_observability
-      format_checks: 'format;tidy'
+      format_checks: 'format'
+
+  tidy-check:
+    name: Code Quality Check / Tidy Check
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc
+      CXX: g++
+      GEN: ninja
+      TIDY_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/checkout@v4
+        with:
+          path: extension-ci-tools
+          ref: v1.5-variegata
+          repository: duckdb/extension-ci-tools
+
+      - name: Install
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq clang-tidy libcurl4-openssl-dev ninja-build
+          sudo pip3 install 'pybind11[global]' --break-system-packages
+
+      - name: Tidy Check Diff
+        run: make tidy-check
