@@ -26,6 +26,10 @@ struct GcloudClient {
 	string endpoint = "https://logging.googleapis.com";
 	//! How to obtain the bearer token for each request.
 	GcloudAuthConfig auth;
+	//! Whether authenticated requests should carry x-goog-user-project when ADC supplies a quota
+	//! project. App Topology authorizes against the topology resource project and does not require
+	//! callers with topology-viewer access to also hold serviceusage.services.use on the ADC project.
+	bool send_quota_project = true;
 	//! Skip TLS certificate/hostname verification (test doubles only).
 	bool insecure_tls = false;
 	//! Per-request connection/read timeout.
@@ -58,6 +62,11 @@ struct GcloudClient {
 
 	//! GET `path` (which must already carry any query string). Convenience wrapper over Request.
 	string Get(ClientContext &context, const string &path, const char *api_name) const;
+
+	//! Issue one protobuf gRPC unary call over HTTP/2. App Topology currently exposes its Preview
+	//! graph generator through gRPC only, so this keeps that transport behind the same authenticated,
+	//! retrying client used by the JSON APIs. `method` is the full `/package.Service/Method` path.
+	string GrpcUnary(ClientContext &context, const string &method, const string &protobuf, const char *api_name) const;
 
 private:
 #ifndef __EMSCRIPTEN__

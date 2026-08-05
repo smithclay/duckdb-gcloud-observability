@@ -17,6 +17,7 @@ static unique_ptr<BaseSecret> CreateGcloudSecretFromConfig(ClientContext &contex
 		auto lower_name = StringUtil::Lower(option.first);
 		if (lower_name == "project" || lower_name == "token" || lower_name == "credentials" ||
 		    lower_name == "quota_project" || lower_name == "universe_domain" || lower_name == "endpoint" ||
+		    lower_name == "monitoring_endpoint" || lower_name == "app_topology_endpoint" ||
 		    lower_name == "insecure_tls") {
 			secret->secret_map[lower_name] = option.second;
 		}
@@ -43,6 +44,7 @@ void RegisterGcloudSecretType(ExtensionLoader &loader) {
 	gcloud_secret_function.named_parameters["universe_domain"] = LogicalType::VARCHAR;
 	gcloud_secret_function.named_parameters["endpoint"] = LogicalType::VARCHAR;
 	gcloud_secret_function.named_parameters["monitoring_endpoint"] = LogicalType::VARCHAR;
+	gcloud_secret_function.named_parameters["app_topology_endpoint"] = LogicalType::VARCHAR;
 	gcloud_secret_function.named_parameters["insecure_tls"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(gcloud_secret_function);
 }
@@ -108,6 +110,7 @@ GcloudCredentials GetGcloudCredentials(ClientContext &context, const string &sec
 	ReadStringKey(*kv_secret, "universe_domain", credentials.universe_domain);
 	ReadStringKey(*kv_secret, "endpoint", credentials.endpoint);
 	ReadStringKey(*kv_secret, "monitoring_endpoint", credentials.monitoring_endpoint);
+	ReadStringKey(*kv_secret, "app_topology_endpoint", credentials.app_topology_endpoint);
 
 	Value value;
 	if (kv_secret->TryGetValue("insecure_tls", value) && !value.IsNull()) {
@@ -146,6 +149,14 @@ string GcloudMonitoringEndpoint(const GcloudCredentials &credentials) {
 		return NormalizeEndpoint(credentials.monitoring_endpoint, "https://monitoring.googleapis.com");
 	}
 	return NormalizeEndpoint("https://monitoring." + credentials.universe_domain, "https://monitoring.googleapis.com");
+}
+
+string GcloudAppTopologyEndpoint(const GcloudCredentials &credentials) {
+	if (!credentials.app_topology_endpoint.empty()) {
+		return NormalizeEndpoint(credentials.app_topology_endpoint, "https://apptopology.googleapis.com");
+	}
+	return NormalizeEndpoint("https://apptopology." + credentials.universe_domain,
+	                         "https://apptopology.googleapis.com");
 }
 
 } // namespace duckdb

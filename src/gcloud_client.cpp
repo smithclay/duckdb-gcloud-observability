@@ -21,7 +21,10 @@
 // instead, so a browser build pulls in neither httplib nor native sockets.
 #include "httplib.hpp"
 
+#include <curl/curl.h>
+
 #include <chrono>
+#include <mutex>
 #include <thread>
 #endif
 
@@ -74,6 +77,12 @@ static void SleepCheckingInterrupt(ClientContext &context, uint64_t seconds) {
 	}
 }
 
+//! Exponential retry delay capped before shifting, so even the maximum accepted retry budget
+//! cannot shift past the width of uint64_t.
+static uint64_t RetryDelaySeconds(uint64_t attempt) {
+	return attempt >= 6 ? 60 : uint64_t(1) << attempt;
+}
+
 //! TLS certificate/hostname failures are configuration or security problems — retrying cannot
 //! succeed and would only delay (or worse, mask) the real error.
 static bool IsRetryableTransportError(duckdb_httplib_openssl::Error error) {
@@ -104,7 +113,7 @@ static uint64_t RateLimitRetryDelaySeconds(const duckdb_httplib_openssl::Respons
 			// Unparseable header (e.g. an HTTP-date Retry-After); fall back to backoff below.
 		}
 	}
-	return MinValue<uint64_t>(uint64_t(1) << attempt, 60); // 1, 2, 4, 8, ... seconds
+	return RetryDelaySeconds(attempt); // 1, 2, 4, 8, ... 60 seconds
 }
 #endif
 
@@ -238,7 +247,7 @@ string GcloudClient::Request(ClientContext &context, const char *method, const s
 				throw IOException("%s API request to %s failed: %s", api_name, endpoint,
 				                  duckdb_httplib_openssl::to_string(error));
 			}
-			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			SleepCheckingInterrupt(context, RetryDelaySeconds(attempt));
 			continue;
 		}
 
@@ -255,7 +264,7 @@ string GcloudClient::Request(ClientContext &context, const char *method, const s
 		}
 		// Server-side errors are usually transient; ride them out rather than lose the query.
 		if (response->status >= 500 && attempt < retries) {
-			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			SleepCheckingInterrupt(context, RetryDelaySeconds(attempt));
 			continue;
 		}
 		if (response->status < 200 || response->status >= 300) {
@@ -264,6 +273,264 @@ string GcloudClient::Request(ClientContext &context, const char *method, const s
 			                  DescribeApiError(response->body));
 		}
 		return response->body;
+	}
+#endif
+}
+
+#ifndef __EMSCRIPTEN__
+namespace {
+
+struct CurlGlobalState {
+	CurlGlobalState() {
+		if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+			throw InternalException("Could not initialize libcurl for the App Topology client");
+		}
+	}
+	~CurlGlobalState() {
+		curl_global_cleanup();
+	}
+};
+
+static CurlGlobalState &GetCurlGlobalState() {
+	static CurlGlobalState state;
+	return state;
+}
+
+struct GrpcResponse {
+	string body;
+	string grpc_status;
+	string grpc_message;
+};
+
+static size_t AppendCurlBody(char *data, size_t size, size_t count, void *userdata) {
+	auto &response = *static_cast<GrpcResponse *>(userdata);
+	auto bytes = size * count;
+	response.body.append(data, bytes);
+	return bytes;
+}
+
+static string TrimHeaderValue(string value) {
+	StringUtil::Trim(value);
+	return value;
+}
+
+static size_t CaptureCurlHeader(char *data, size_t size, size_t count, void *userdata) {
+	auto &response = *static_cast<GrpcResponse *>(userdata);
+	auto bytes = size * count;
+	string header(data, bytes);
+	auto colon = header.find(':');
+	if (colon == string::npos) {
+		return bytes;
+	}
+	auto name = StringUtil::Lower(header.substr(0, colon));
+	auto value = TrimHeaderValue(header.substr(colon + 1));
+	if (name == "grpc-status") {
+		response.grpc_status = value;
+	} else if (name == "grpc-message") {
+		response.grpc_message = value;
+	}
+	return bytes;
+}
+
+static int CurlProgress(void *userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+	auto &context = *static_cast<ClientContext *>(userdata);
+	return context.interrupted ? 1 : 0;
+}
+
+static string PercentDecodeGrpcMessage(const string &value) {
+	string result;
+	result.reserve(value.size());
+	for (idx_t i = 0; i < value.size(); i++) {
+		if (value[i] == '%' && i + 2 < value.size()) {
+			auto hex = [](char ch) -> int {
+				if (ch >= '0' && ch <= '9')
+					return ch - '0';
+				if (ch >= 'a' && ch <= 'f')
+					return ch - 'a' + 10;
+				if (ch >= 'A' && ch <= 'F')
+					return ch - 'A' + 10;
+				return -1;
+			};
+			auto high = hex(value[i + 1]);
+			auto low = hex(value[i + 2]);
+			if (high >= 0 && low >= 0) {
+				result.push_back(static_cast<char>((high << 4) | low));
+				i += 2;
+				continue;
+			}
+		}
+		result.push_back(value[i]);
+	}
+	return result;
+}
+
+static string FrameGrpcMessage(const string &protobuf) {
+	if (protobuf.size() > std::numeric_limits<uint32_t>::max()) {
+		throw InvalidInputException("App Topology request is too large for one gRPC message");
+	}
+	auto length = static_cast<uint32_t>(protobuf.size());
+	string result(5, '\0');
+	result[1] = static_cast<char>((length >> 24) & 0xff);
+	result[2] = static_cast<char>((length >> 16) & 0xff);
+	result[3] = static_cast<char>((length >> 8) & 0xff);
+	result[4] = static_cast<char>(length & 0xff);
+	result.append(protobuf);
+	return result;
+}
+
+static string UnframeGrpcMessage(const string &body) {
+	idx_t offset = 0;
+	string result;
+	idx_t messages = 0;
+	while (offset < body.size()) {
+		if (body.size() - offset < 5) {
+			throw IOException("App Topology API returned a truncated gRPC frame");
+		}
+		auto flags = static_cast<uint8_t>(body[offset]);
+		auto length = (static_cast<uint32_t>(static_cast<uint8_t>(body[offset + 1])) << 24) |
+		              (static_cast<uint32_t>(static_cast<uint8_t>(body[offset + 2])) << 16) |
+		              (static_cast<uint32_t>(static_cast<uint8_t>(body[offset + 3])) << 8) |
+		              static_cast<uint32_t>(static_cast<uint8_t>(body[offset + 4]));
+		offset += 5;
+		if (length > body.size() - offset) {
+			throw IOException("App Topology API returned a truncated gRPC message");
+		}
+		if (flags & 1) {
+			throw IOException("App Topology API returned a compressed gRPC message, which is not supported");
+		}
+		if (flags & 0x80) {
+			// gRPC-Web trailer frames are not expected from the native API, but safely skip one if a
+			// test proxy translates the call.
+			offset += length;
+			continue;
+		}
+		if (++messages > 1) {
+			throw IOException("App Topology API returned more than one message for a unary gRPC call");
+		}
+		result.assign(body.data() + offset, length);
+		offset += length;
+	}
+	if (messages != 1) {
+		throw IOException("App Topology API returned no message for a unary gRPC call");
+	}
+	return result;
+}
+
+static bool RetryableGrpcStatus(const string &status) {
+	return status == "8" || status == "13" || status == "14"; // RESOURCE_EXHAUSTED, INTERNAL, UNAVAILABLE
+}
+
+static bool IsRetryableCurlError(CURLcode code) {
+	switch (code) {
+	case CURLE_COULDNT_RESOLVE_PROXY:
+	case CURLE_COULDNT_RESOLVE_HOST:
+	case CURLE_COULDNT_CONNECT:
+	case CURLE_PARTIAL_FILE:
+	case CURLE_HTTP2:
+	case CURLE_SEND_ERROR:
+	case CURLE_RECV_ERROR:
+	case CURLE_OPERATION_TIMEDOUT:
+	case CURLE_GOT_NOTHING:
+	case CURLE_AGAIN:
+	case CURLE_HTTP2_STREAM:
+		return true;
+	default:
+		return false;
+	}
+}
+
+} // namespace
+#endif
+
+string GcloudClient::GrpcUnary(ClientContext &context, const string &method, const string &protobuf,
+                               const char *api_name) const {
+#ifdef __EMSCRIPTEN__
+	throw NotImplementedException("%s service maps require native gRPC/HTTP2 and are not available in DuckDB-WASM",
+	                              api_name);
+#else
+	(void)GetCurlGlobalState();
+	auto framed = FrameGrpcMessage(protobuf);
+	auto url = endpoint + method;
+	bool token_refreshed = false;
+	for (uint64_t attempt = 0;; attempt++) {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		auto access_token = GetGcloudAccessToken(context, auth);
+		GrpcResponse response;
+		char curl_error[CURL_ERROR_SIZE] = {0};
+		auto curl = curl_easy_init();
+		if (!curl) {
+			throw InternalException("Could not initialize an App Topology HTTP/2 request");
+		}
+		curl_slist *headers = nullptr;
+		headers = curl_slist_append(headers, ("authorization: Bearer " + access_token.token).c_str());
+		headers = curl_slist_append(headers, "content-type: application/grpc");
+		headers = curl_slist_append(headers, "te: trailers");
+		if (send_quota_project && !access_token.quota_project.empty()) {
+			headers = curl_slist_append(headers, ("x-goog-user-project: " + access_token.quota_project).c_str());
+		}
+		curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		curl_easy_setopt(curl, CURLOPT_POST, 1L);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, framed.data());
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(framed.size()));
+		curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout_seconds));
+		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, static_cast<long>(timeout_seconds));
+		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, AppendCurlBody);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, CaptureCurlHeader);
+		curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response);
+		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CurlProgress);
+		curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
+		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
+		if (insecure_tls) {
+			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+		}
+
+		auto code = curl_easy_perform(curl);
+		long http_status = 0;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+		curl_slist_free_all(headers);
+		curl_easy_cleanup(curl);
+
+		if (code == CURLE_ABORTED_BY_CALLBACK && context.interrupted) {
+			throw InterruptException();
+		}
+		if (code != CURLE_OK) {
+			if (attempt < retries && IsRetryableCurlError(code)) {
+				SleepCheckingInterrupt(context, RetryDelaySeconds(attempt));
+				continue;
+			}
+			throw IOException("%s gRPC request to %s failed: %s", api_name, endpoint,
+			                  curl_error[0] ? curl_error : curl_easy_strerror(code));
+		}
+		if (http_status == 401 && !token_refreshed) {
+			token_refreshed = true;
+			InvalidateGcloudTokenCache(auth);
+			continue;
+		}
+		if ((http_status == 429 || http_status >= 500 || RetryableGrpcStatus(response.grpc_status)) &&
+		    attempt < retries) {
+			SleepCheckingInterrupt(context, RetryDelaySeconds(attempt));
+			continue;
+		}
+		if (http_status < 200 || http_status >= 300) {
+			throw IOException("%s gRPC endpoint returned HTTP %d", api_name, http_status);
+		}
+		if (response.grpc_status.empty()) {
+			throw IOException("%s gRPC response did not include a grpc-status trailer", api_name);
+		}
+		if (response.grpc_status != "0") {
+			auto message = PercentDecodeGrpcMessage(response.grpc_message);
+			throw IOException("%s gRPC returned status %s: %s", api_name, response.grpc_status,
+			                  message.empty() ? "unknown error" : message);
+		}
+		return UnframeGrpcMessage(response.body);
 	}
 #endif
 }

@@ -16,6 +16,7 @@ set(TARGET_NAME gcloud_observability)
 # credential path, which is why a browser build authenticates with a pre-minted TOKEN only.
 if(NOT EMSCRIPTEN)
   find_package(OpenSSL REQUIRED)
+  find_package(CURL REQUIRED)
 endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
@@ -37,9 +38,17 @@ endif()
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/gcloud_observability_extension.cpp src/gcloud_secret.cpp src/gcloud_auth.cpp
-                      src/gcloud_client.cpp src/gcloud_json.cpp src/logs_table.cpp
-                      src/alerts_table.cpp src/gcloud_catalog.cpp)
+set(EXTENSION_SOURCES
+    src/gcloud_observability_extension.cpp
+    src/gcloud_secret.cpp
+    src/gcloud_auth.cpp
+    src/gcloud_client.cpp
+    src/gcloud_json.cpp
+    src/gcloud_topology.cpp
+    src/logs_table.cpp
+    src/alerts_table.cpp
+    src/service_dependencies_table.cpp
+    src/gcloud_catalog.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -52,14 +61,15 @@ foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
     # build.
     target_include_directories(${target} PRIVATE "${GCLOUD_DUCKDB_DIR}/third_party/httplib")
     target_compile_definitions(${target} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-    target_link_libraries(${target} OpenSSL::SSL OpenSSL::Crypto)
+    target_link_libraries(${target} OpenSSL::SSL OpenSSL::Crypto CURL::libcurl)
   endif()
 endforeach()
 
 # Offline C++ test for the pure request-building and response-parsing helpers. Deliberately a C++
 # test rather than test-only SQL functions, keeping internals out of the extension's SQL surface.
 if(NOT EMSCRIPTEN)
-  add_executable(gcloud_json_test EXCLUDE_FROM_ALL test/cpp/gcloud_json_test.cpp src/gcloud_json.cpp)
+  add_executable(gcloud_json_test EXCLUDE_FROM_ALL test/cpp/gcloud_json_test.cpp src/gcloud_json.cpp
+                                                         src/gcloud_topology.cpp)
   target_include_directories(
     gcloud_json_test PRIVATE src/include
                              "${GCLOUD_DUCKDB_DIR}/third_party/yyjson/include")

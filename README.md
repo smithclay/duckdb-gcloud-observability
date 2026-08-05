@@ -1,7 +1,8 @@
 # duckdb-gcloud-observability
 
-A DuckDB extension for querying **Google Cloud Observability** telemetry as SQL tables. Today it
-reads Cloud Logging; the name leaves room for metrics and traces.
+A DuckDB extension for querying **Google Cloud Observability** telemetry and application topology
+as SQL tables. It reads Cloud Logging, Cloud Monitoring alerts, and [App Topology][app-topology]
+service traffic.
 
 `read_gcloud_logs()` queries the [Cloud Logging `entries.list` API][entries-list] and returns rows in
 the same flat 18-column OTLP schema as [`duckdb-otlp`][duckdb-otlp]'s `read_otlp_logs`, so logs from
@@ -44,8 +45,9 @@ Both `authorized_user` credentials (refresh-token grant) and `service_account` k
 self-signed JWT assertion) are supported. Tokens are cached in-process and refreshed a minute before
 they expire.
 
-The principal needs `roles/logging.viewer` (or `logging.logEntries.list`) for log queries and
-`roles/monitoring.viewer` for the alert tables.
+The principal needs `roles/logging.viewer` (or `logging.logEntries.list`) for log queries,
+`roles/monitoring.viewer` for the alert tables, and
+[`roles/apptopology.viewer`][app-topology-iam] for service maps.
 
 ### Secrets
 
@@ -75,10 +77,26 @@ CREATE SECRET (TYPE gcloud, PROJECT 'my-project', TOKEN '<access token>');
 | `UNIVERSE_DOMAIN` | `googleapis.com`   | Sovereign Cloud / non-standard universes |
 | `ENDPOINT`        | derived            | Cloud Logging API base override, e.g. `https://logging.googleapis.com` |
 | `MONITORING_ENDPOINT` | derived        | Cloud Monitoring API base override (the alert tables) |
+| `APP_TOPOLOGY_ENDPOINT` | derived      | App Topology gRPC API base override |
 | `INSECURE_TLS`    | `false`            | Skip TLS verification (test doubles only) |
 
-`ENDPOINT` and `MONITORING_ENDPOINT` are separate because the two APIs live on different hosts, so
-one override cannot stand in for both.
+The endpoint overrides are separate because each API lives on a different host.
+
+## Service dependencies
+
+`read_gcloud_service_dependencies()` calls App Topology's generated SRE graph directly. It asks for
+`Base/DiscoveredService --Observability/SENDS_TRAFFIC→ Base/DiscoveredService`; it does **not** list
+or scan Cloud Trace spans.
+
+```sql
+SELECT source_service, target_service, source_type, target_type, edge_attributes
+FROM read_gcloud_service_dependencies(project => 'my-project');
+```
+
+The 17-column result matches the CloudWatch and Datadog dependency readers. App Topology returns a
+current graph rather than a user-selected aggregation window, so `window_start`, `window_end`, and
+the canonical request/error/fault/throttle counters remain `NULL`. Provider-specific traffic
+properties such as latency or error rate are preserved in `edge_attributes` JSON.
 
 ## `read_gcloud_logs` parameters
 
@@ -140,8 +158,8 @@ WHERE severity_text = 'ERROR'
 
 ## Catalog (`ATTACH`)
 
-`ATTACH 'gcloud:'` exposes the project as a read-only database, so log entries and Cloud Monitoring
-alerts are ordinary tables that joins, views, and BI tools can reach without naming a table function.
+`ATTACH 'gcloud:'` exposes the project as a read-only database, so logs, alerts, and the service map
+are ordinary tables that joins, views, and BI tools can reach without naming a table function.
 
 ```sql
 ATTACH 'gcloud:' AS gcp (TYPE gcloud, PROJECT 'my-project', START_TIME '-1h', MAX_ROWS 1000);
@@ -151,6 +169,8 @@ SELECT severity_text, count(*) FROM gcp.logs.entries GROUP BY 1 ORDER BY 2 DESC;
 SELECT policy_name, policy_severity, metric_type, opened_at
 FROM gcp.alerts.open
 ORDER BY opened_at DESC;
+
+SELECT source_service, target_service FROM gcp.service_map.dependencies;
 ```
 
 | Table | Source | Notes |
@@ -158,11 +178,12 @@ ORDER BY opened_at DESC;
 | `logs.entries` | `entries.list` | The same 18 columns as `read_gcloud_logs`, and the same pushdown |
 | `alerts.open` | `projects.alerts.list`, filtered to `state=OPEN` | Currently-open incidents and their resource, metric, log, and policy metadata |
 | `alerts.policies` | `projects.alertPolicies.list` | Alerting policy configuration (GA) |
+| `service_map.dependencies` | App Topology `GenerateDiscoveredResourcesTopology` | SRE service traffic edges in the canonical 17-column dependency schema |
 
 ATTACH options: `SECRET`, `PROJECT`, `FILTER`, `START_TIME`, `END_TIME`, `ORDER_BY`, `PAGE_SIZE`,
-`MAX_ROWS`, `RETRIES`, `TIMEOUT`. They are validated by the same code as the table function's
-parameters, so the two interfaces cannot drift. The log settings apply to `logs.entries`;
-`MAX_ROWS`, `RETRIES`, and `TIMEOUT` also apply to the alert tables.
+`MAX_ROWS`, `RETRIES`, `TIMEOUT`, `APP_TOPOLOGY_ENDPOINT`. They are validated by the same code as
+the table function's parameters, so the two interfaces cannot drift. The log settings apply to
+`logs.entries`; `MAX_ROWS`, `RETRIES`, and `TIMEOUT` also apply to the alert and service-map tables.
 
 The secret is resolved at attach time (so a bad name fails immediately) but only its *name* is
 retained, so a later `CREATE OR REPLACE SECRET` is picked up on the next query.
@@ -247,6 +268,10 @@ The extension builds for WASM (`make wasm_mvp` / `wasm_eh` / `wasm_threads`, usi
 `extension_config_wasm.cmake`). Two things differ from a native build, and both are hard
 constraints rather than choices.
 
+The App Topology table is native-only: Google's Preview graph generator is protobuf gRPC over
+HTTP/2, while the browser build's transport is JSON/fetch based. Binding still works in WASM, but a
+service-map scan raises a clear unsupported-operation error.
+
 **Authentication is `TOKEN`-only.** A browser has no filesystem to discover Application Default
 Credentials on and no OpenSSL to sign a service-account assertion with — and here OpenSSL is not
 just the TLS backend, it is the RS256 signer. That removes both of the native credential paths and
@@ -318,6 +343,8 @@ It needs `roles/logging.logWriter` in addition to `roles/logging.viewer`, and wr
 no separate `gcloud auth login` is required.
 
 [entries-list]: https://cloud.google.com/logging/docs/reference/v2/rest/v2/entries/list
+[app-topology]: https://cloud.google.com/hub/docs/app-topology
+[app-topology-iam]: https://cloud.google.com/iam/docs/roles-permissions/apptopology
 [filter]: https://cloud.google.com/logging/docs/view/logging-query-language
 [encoding-ext]: https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/encoding/googlecloudlogentryencodingextension
 [duckdb-otlp]: https://github.com/duckdb/duckdb

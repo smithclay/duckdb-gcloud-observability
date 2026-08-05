@@ -3,6 +3,7 @@
 #include "alerts_table.hpp"
 #include "gcloud_secret.hpp"
 #include "logs_table.hpp"
+#include "service_dependencies_table.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -40,6 +41,7 @@ struct GcloudAttachOptions {
 	string project;
 	GcloudLogsSettings logs;
 	GcloudAlertsSettings alerts;
+	GcloudServiceMapSettings service_map;
 };
 
 //===--------------------------------------------------------------------===//
@@ -117,6 +119,19 @@ public:
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
 		return GetGcloudAlertPoliciesTableScan(context, *this, options.secret_name, options.alerts, bind_data);
+	}
+};
+
+class GcloudServiceDependenciesTableEntry : public GcloudTableEntry {
+public:
+	GcloudServiceDependenciesTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
+	                                    const GcloudAttachOptions &options)
+	    : GcloudTableEntry(catalog, schema, "dependencies", options, GetGcloudServiceDependenciesSchema) {
+	}
+
+	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
+		return GetGcloudServiceDependenciesTableScan(context, *this, options.secret_name, options.service_map,
+		                                             bind_data);
 	}
 };
 
@@ -223,10 +238,13 @@ class GcloudCatalog : public Catalog {
 public:
 	GcloudCatalog(AttachedDatabase &db, GcloudAttachOptions options)
 	    : Catalog(db), logs_schema(make_uniq<GcloudSchemaEntry>(*this, "logs")),
-	      alerts_schema(make_uniq<GcloudSchemaEntry>(*this, "alerts")) {
+	      alerts_schema(make_uniq<GcloudSchemaEntry>(*this, "alerts")),
+	      service_map_schema(make_uniq<GcloudSchemaEntry>(*this, "service_map")) {
 		logs_schema->AddTable(make_uniq<GcloudLogsTableEntry>(*this, *logs_schema, options));
 		alerts_schema->AddTable(make_uniq<GcloudOpenAlertsTableEntry>(*this, *alerts_schema, options));
 		alerts_schema->AddTable(make_uniq<GcloudAlertPoliciesTableEntry>(*this, *alerts_schema, options));
+		service_map_schema->AddTable(
+		    make_uniq<GcloudServiceDependenciesTableEntry>(*this, *service_map_schema, options));
 	}
 
 	void Initialize(bool) override {
@@ -243,6 +261,7 @@ public:
 	void ScanSchemas(ClientContext &, std::function<void(SchemaCatalogEntry &)> callback) override {
 		callback(*logs_schema);
 		callback(*alerts_schema);
+		callback(*service_map_schema);
 	}
 
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction, const EntryLookupInfo &schema_lookup,
@@ -252,6 +271,9 @@ public:
 		}
 		if (StringUtil::CIEquals(schema_lookup.GetEntryName(), "alerts")) {
 			return alerts_schema.get();
+		}
+		if (StringUtil::CIEquals(schema_lookup.GetEntryName(), "service_map")) {
+			return service_map_schema.get();
 		}
 		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 			throw CatalogException(schema_lookup.GetErrorContext(), "Schema with name %s does not exist!",
@@ -294,6 +316,7 @@ private:
 
 	unique_ptr<GcloudSchemaEntry> logs_schema;
 	unique_ptr<GcloudSchemaEntry> alerts_schema;
+	unique_ptr<GcloudSchemaEntry> service_map_schema;
 };
 
 class GcloudTransaction : public Transaction {
@@ -393,11 +416,14 @@ static unique_ptr<Catalog> AttachGcloud(optional_ptr<StorageExtensionInfo>, Clie
 			attach.logs.retries = ParseAttachInteger("RETRIES", option.second);
 		} else if (key == "timeout") {
 			attach.logs.timeout_seconds = ParseAttachInteger("TIMEOUT", option.second);
+		} else if (key == "app_topology_endpoint") {
+			attach.service_map.endpoint = ParseAttachString("APP_TOPOLOGY_ENDPOINT", option.second);
 		} else {
-			throw InvalidInputException("Unsupported gcloud ATTACH option '%s'; supported options are SECRET, PROJECT, "
-			                            "FILTER, START_TIME, END_TIME, ORDER_BY, PAGE_SIZE, MAX_ROWS, RETRIES, and "
-			                            "TIMEOUT",
-			                            option.first);
+			throw InvalidInputException(
+			    "Unsupported gcloud ATTACH option '%s'; supported options are SECRET, PROJECT, "
+			    "FILTER, START_TIME, END_TIME, ORDER_BY, PAGE_SIZE, MAX_ROWS, RETRIES, TIMEOUT, "
+			    "and APP_TOPOLOGY_ENDPOINT",
+			    option.first);
 		}
 	}
 	ValidateGcloudLogsSettings(attach.logs, "gcloud ATTACH");
@@ -408,6 +434,11 @@ static unique_ptr<Catalog> AttachGcloud(optional_ptr<StorageExtensionInfo>, Clie
 	attach.alerts.max_rows = attach.logs.max_rows;
 	attach.alerts.retries = attach.logs.retries;
 	attach.alerts.timeout_seconds = attach.logs.timeout_seconds;
+	attach.service_map.project = attach.project;
+	attach.service_map.max_rows = attach.logs.max_rows;
+	attach.service_map.retries = attach.logs.retries;
+	attach.service_map.timeout_seconds = attach.logs.timeout_seconds;
+	ValidateGcloudServiceMapSettings(attach.service_map, "gcloud ATTACH service map");
 
 	// Resolve the secret once at attach time so a bad name fails here rather than at first query.
 	// Only its name is retained, so a later CREATE OR REPLACE SECRET is picked up.
