@@ -21,6 +21,11 @@ SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_gcloud_
 ----
 true
 
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'send_gcloud_logs';
+----
+true
+
 # The custom secret type works with Application Default Credentials (no token, no key file).
 statement ok
 CREATE SECRET gcloud_adc (
@@ -61,6 +66,37 @@ query I
 SELECT secret_string LIKE '%/path/to/service-account.json%' FROM duckdb_secrets() WHERE name = 'gcloud_key';
 ----
 true
+
+# The sender mirrors the Datadog scalar contract: an OTLP-shaped row STRUCT, optional constant
+# secret name, VARCHAR result, and unknown fields ignored. Binding never mints a token or writes.
+query I
+SELECT column_type = 'VARCHAR'
+FROM (DESCRIBE SELECT send_gcloud_logs({'body': 'hi', 'service_name': 'checkout', 'unknown_extra': 1},
+                                      'gcloud_adc'));
+----
+true
+
+# A NULL struct is NULL/no-op, so this execution remains fully offline.
+query I
+SELECT send_gcloud_logs(NULL::STRUCT(body VARCHAR), 'gcloud_adc') IS NULL;
+----
+true
+
+statement error
+DESCRIBE SELECT send_gcloud_logs('not a struct', 'gcloud_adc');
+----
+first argument must be a STRUCT
+
+statement error
+DESCRIBE SELECT send_gcloud_logs({'body': 'hi'}, 'no_such_secret');
+----
+No secret with name 'no_such_secret' found
+
+statement error
+DESCRIBE SELECT send_gcloud_logs({'body': 'hi'}, secret_name)
+FROM (VALUES ('gcloud_adc')) secrets(secret_name);
+----
+secret name must be a constant string
 
 # Referencing a secret that does not exist fails at bind time.
 statement error

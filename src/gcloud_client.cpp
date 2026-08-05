@@ -33,6 +33,7 @@ using namespace duckdb_yyjson; // NOLINT
 namespace duckdb {
 
 static constexpr const char *kEntriesListPath = "/v2/entries:list";
+static constexpr const char *kEntriesWritePath = "/v2/entries:write";
 
 // Defined here, where `Client` is complete, so the header's unique_ptr<Client> member can point at
 // a forward-declared type. The destructor uses an empty body rather than `= default` to keep
@@ -93,6 +94,21 @@ static bool IsRetryableTransportError(duckdb_httplib_openssl::Error error) {
 		return false;
 	default:
 		return true;
+	}
+}
+
+//! Transport failures known to happen before request bytes reach the API. A read/write/unknown
+//! failure can mean entries.write accepted the batch but its response was lost, so retrying those
+//! would risk storing duplicates.
+static bool IsPreSendTransportError(duckdb_httplib_openssl::Error error) {
+	switch (error) {
+	case duckdb_httplib_openssl::Error::Connection:
+	case duckdb_httplib_openssl::Error::ConnectionTimeout:
+	case duckdb_httplib_openssl::Error::BindIPAddress:
+	case duckdb_httplib_openssl::Error::ProxyConnection:
+		return true;
+	default:
+		return false;
 	}
 }
 
@@ -537,6 +553,102 @@ string GcloudClient::GrpcUnary(ClientContext &context, const string &method, con
 
 string GcloudClient::ListEntries(ClientContext &context, const string &json_body) const {
 	return Request(context, "POST", kEntriesListPath, json_body, "Cloud Logging");
+}
+
+string GcloudClient::WriteEntries(ClientContext &context, const string &json_body) const {
+	string origin, path_prefix;
+	SplitGcloudEndpoint(endpoint, origin, path_prefix);
+	auto full_path = path_prefix + kEntriesWritePath;
+
+#ifdef __EMSCRIPTEN__
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+	string authorization, quota_project;
+	BuildAuthHeaders(context, auth, authorization, quota_project);
+	auto &http_util = HTTPUtil::Get(*context.db);
+	auto url = origin + full_path;
+	auto params = http_util.InitializeParameters(context, url);
+	params->timeout = timeout_seconds;
+	// Browser fetch cannot tell whether a failed write reached the server. Never retry an ambiguous
+	// failure automatically; callers can decide whether to replay the batch.
+	params->retries = 0;
+	params->keep_alive = true;
+	params->follow_location = false;
+
+	HTTPHeaders headers;
+	headers.Insert("Authorization", authorization);
+	headers.Insert("Accept", "application/json");
+	headers.Insert("Content-Type", "application/json");
+	if (send_quota_project && !quota_project.empty()) {
+		headers.Insert("x-goog-user-project", quota_project);
+	}
+	PostRequestInfo request(url, headers, *params, reinterpret_cast<const_data_ptr_t>(json_body.data()),
+	                        json_body.size());
+	request.try_request = true;
+	auto response = http_util.Request(request);
+	if (!response) {
+		throw IOException("Cloud Logging entries.write request to %s failed: no response (the batch might have been "
+		                  "accepted; it was not retried)",
+		                  url);
+	}
+	if (!response->Success()) {
+		if (response->status != HTTPStatusCode::INVALID) {
+			throw IOException("Cloud Logging entries.write returned HTTP %d: %s",
+			                  static_cast<uint16_t>(response->status), DescribeApiError(response->body));
+		}
+		throw IOException("Cloud Logging entries.write request to %s failed: %s (the batch might have been accepted; "
+		                  "it was not retried)",
+		                  url, response->GetError());
+	}
+	return response->body;
+#else
+	bool token_refreshed = false;
+	for (uint64_t attempt = 0;; attempt++) {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		string authorization, quota_project;
+		BuildAuthHeaders(context, auth, authorization, quota_project);
+		duckdb_httplib_openssl::Headers headers = {
+		    {"Authorization", authorization},
+		    {"Accept", "application/json"},
+		};
+		if (send_quota_project && !quota_project.empty()) {
+			headers.emplace("x-goog-user-project", quota_project);
+		}
+		auto response = GetConnection().Post(full_path.c_str(), headers, json_body, "application/json");
+		if (!response) {
+			auto error = response.error();
+			connection.reset();
+			if (attempt < retries && IsPreSendTransportError(error)) {
+				SleepCheckingInterrupt(context, RetryDelaySeconds(attempt));
+				continue;
+			}
+			throw IOException(
+			    "Cloud Logging entries.write request to %s failed: %s%s", endpoint,
+			    duckdb_httplib_openssl::to_string(error),
+			    IsPreSendTransportError(error) ? "" : " (the batch might have been accepted; it was not retried)");
+		}
+		if (response->status == 401 && !token_refreshed) {
+			token_refreshed = true;
+			InvalidateGcloudTokenCache(auth);
+			continue;
+		}
+		// A 429 is an explicit rejection and safe to replay. Do not retry 5xx responses: Google does
+		// not guarantee that a write was uncommitted before that response, and insertId is not a full
+		// storage/export idempotency guarantee.
+		if (response->status == 429 && attempt < retries) {
+			SleepCheckingInterrupt(context, RateLimitRetryDelaySeconds(*response, attempt));
+			continue;
+		}
+		if (response->status < 200 || response->status >= 300) {
+			throw IOException("Cloud Logging entries.write returned HTTP %d: %s", response->status,
+			                  DescribeApiError(response->body));
+		}
+		return response->body;
+	}
+#endif
 }
 
 string GcloudClient::Get(ClientContext &context, const string &path, const char *api_name) const {

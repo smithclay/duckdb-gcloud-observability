@@ -1,5 +1,6 @@
 #include "gcloud_json.hpp"
 #include "gcloud_topology.hpp"
+#include "send_logs.hpp"
 
 #include <cstring>
 #include <iostream>
@@ -197,6 +198,65 @@ int main() {
 		        "traffic relationship properties should be preserved as JSON");
 		Require(ParseGcloudServiceDependenciesResponse(string()).empty(),
 		        "an empty topology response should produce no dependency rows");
+
+		//===------------------------------------------------------------===//
+		// entries.write request (send_gcloud_logs)
+		//===------------------------------------------------------------===//
+		GcloudWriteLog write_log;
+		write_log.project = "my-project";
+		write_log.body = "checkout failed";
+		write_log.service_name = "checkout";
+		write_log.service_namespace = "store";
+		write_log.service_instance_id = "checkout-7";
+		write_log.severity = "ERROR";
+		write_log.trace_id = "0123456789abcdef0123456789abcdef";
+		write_log.span_id = "0123456789abcdef";
+		write_log.trace_sampled = true;
+		write_log.has_timestamp_nanos = true;
+		write_log.timestamp_nanos = 123456789;
+		write_log.resource_attributes_json =
+		    R"({"cloud.resource_id":"run.googleapis.com%2Fstdout","gcp.resource_type":"cloud_run_revision","gcp.label.location":"us-west1"})";
+		write_log.log_attributes_json =
+		    R"({"log.record.uid":"stable-id","gcp.label.team":"payments","attempt":3,"message":"must-not-win"})";
+		auto write_body = BuildGcloudWriteBody({write_log});
+		Require(write_body.find(R"("partialSuccess":false)") != string::npos,
+		        "entries.write should use all-or-error batch semantics");
+		Require(write_body.find(R"("logName":"projects/my-project/logs/run.googleapis.com%2Fstdout")") != string::npos,
+		        "cloud.resource_id should select the URL-encoded log id under the configured project");
+		Require(write_body.find(R"("type":"cloud_run_revision")") != string::npos &&
+		            write_body.find(R"("location":"us-west1")") != string::npos,
+		        "gcp resource attributes should map to MonitoredResource");
+		Require(write_body.find(R"("timestamp":"1970-01-01T00:00:00.123456789Z")") != string::npos,
+		        "OTLP nanoseconds should retain all nine fractional digits");
+		Require(write_body.find(R"("severity":"ERROR")") != string::npos &&
+		            write_body.find(R"("insertId":"stable-id")") != string::npos,
+		        "severity and log.record.uid should map to LogEntry fields");
+		Require(write_body.find(R"("trace":"0123456789abcdef0123456789abcdef")") != string::npos &&
+		            write_body.find(R"("spanId":"0123456789abcdef")") != string::npos &&
+		            write_body.find(R"("traceSampled":true)") != string::npos,
+		        "trace correlation fields should map without losing the sampled flag");
+		Require(write_body.find(R"("team":"payments")") != string::npos &&
+		            write_body.find(R"("service_name":"checkout")") != string::npos,
+		        "gcp labels and service identity should become LogEntry labels");
+		Require(write_body.find(R"("message":"checkout failed")") != string::npos &&
+		            write_body.find(R"("attempt":3)") != string::npos &&
+		            write_body.find("must-not-win") == string::npos,
+		        "the body should win reserved payload keys while arbitrary log attributes are preserved");
+		Require(EstimateGcloudWriteLogBytes(write_log) > write_log.body.size(),
+		        "the batch estimator should include escaping and envelope slack");
+
+		GcloudWriteLog plain_log;
+		plain_log.project = "my-project";
+		plain_log.body = "plain text";
+		plain_log.severity = "INFO";
+		plain_log.insert_id = "plain-id";
+		plain_log.has_timestamp_nanos = true;
+		auto plain_body = BuildGcloudWriteBody({plain_log});
+		Require(plain_body.find(R"("logName":"projects/my-project/logs/duckdb")") != string::npos,
+		        "the configured project and duckdb log id should form the default log name");
+		Require(plain_body.find(R"("textPayload":"plain text")") != string::npos &&
+		            plain_body.find("jsonPayload") == string::npos,
+		        "a log with no custom attributes should use LogEntry textPayload");
 
 		//===------------------------------------------------------------===//
 		// Row budget

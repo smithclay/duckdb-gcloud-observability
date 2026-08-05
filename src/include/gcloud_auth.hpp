@@ -9,6 +9,10 @@ class ClientContext;
 //! googlecloudmonitoringreceiver, which calls google.FindDefaultCredentials(ctx, <read scope>).
 extern const char *const kLoggingReadScope;
 
+//! OAuth2 scope requested by entries.write. Kept separate from the read scope so a service-account
+//! token used only for queries is never granted write authority.
+extern const char *const kLoggingWriteScope;
+
 //! OAuth2 scope for the Cloud Monitoring read path, used by the alerts tables. Requested separately
 //! from the logging scope so a logs-only query never asks for monitoring authority (and vice
 //! versa); the token cache is keyed by scope, so the two coexist.

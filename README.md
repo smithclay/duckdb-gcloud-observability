@@ -1,8 +1,8 @@
 # duckdb-gcloud-observability
 
-A DuckDB extension for querying **Google Cloud Observability** telemetry and application topology
-as SQL tables. It reads Cloud Logging, Cloud Monitoring alerts, and [App Topology][app-topology]
-service traffic.
+A DuckDB extension for reading and writing **Google Cloud Observability** telemetry and querying
+application topology as SQL tables. It reads and writes Cloud Logging, reads Cloud Monitoring
+alerts, and reads [App Topology][app-topology] service traffic.
 
 `read_gcloud_logs()` queries the [Cloud Logging `entries.list` API][entries-list] and returns rows in
 the same flat 18-column OTLP schema as [`duckdb-otlp`][duckdb-otlp]'s `read_otlp_logs`, so logs from
@@ -46,6 +46,7 @@ self-signed JWT assertion) are supported. Tokens are cached in-process and refre
 they expire.
 
 The principal needs `roles/logging.viewer` (or `logging.logEntries.list`) for log queries,
+`roles/logging.logWriter` (or `logging.logEntries.create`) for `send_gcloud_logs`,
 `roles/monitoring.viewer` for the alert tables, and
 [`roles/apptopology.viewer`][app-topology-iam] for service maps.
 
@@ -81,6 +82,56 @@ CREATE SECRET (TYPE gcloud, PROJECT 'my-project', TOKEN '<access token>');
 | `INSECURE_TLS`    | `false`            | Skip TLS verification (test doubles only) |
 
 The endpoint overrides are separate because each API lives on a different host.
+
+## Sending logs
+
+`send_gcloud_logs` writes an OTLP-shaped row through Cloud Logging's [`entries.write` API][entries-write].
+It mirrors the Datadog sender contract: pass a whole row STRUCT, optionally followed by a constant
+gcloud secret name, and the function returns `ok` for each accepted row. A NULL struct returns NULL
+and sends nothing.
+
+```sql
+CREATE SECRET gcp_prod (TYPE gcloud, PROJECT 'my-project');
+
+SELECT send_gcloud_logs(l, 'gcp_prod')
+FROM my_otlp_logs l;
+```
+
+Recognized fields include the extension's 18 OTLP log columns plus the provider-specific aliases
+`log_name`, `log_id`, `resource_type`, `insert_id`, and `trace_sampled`. Unknown columns are ignored.
+The important mappings are:
+
+| Input | Cloud Logging `LogEntry` |
+|---|---|
+| `body` / `message` | `jsonPayload.message` (or `textPayload` when there is no structured content) |
+| `time_unix_nano` / `timestamp` | nanosecond RFC 3339 `timestamp`; missing values use send time |
+| `severity_text` / `severity_number` | canonical `LogSeverity` |
+| `trace_id`, `span_id`, `flags & 1` | `trace`, `spanId`, `traceSampled` |
+| `resource_attributes.gcp.resource_type` | monitored-resource `type` |
+| `resource_attributes.gcp.label.*` | monitored-resource labels |
+| `resource_attributes.cloud.resource_id` | log ID under the configured destination project |
+| `log_attributes.log.record.uid` | `insertId` |
+| `log_attributes.gcp.label.*` | entry labels |
+| remaining `log_attributes` | fields in `jsonPayload` |
+
+The configured secret/ADC project is the destination. The default log is
+`projects/<project>/logs/duckdb` on a `global` monitored resource; `cloud.resource_id`, `log_id`, or
+an explicit `log_name` in that project can select another log. `/` in a raw log ID is percent-encoded.
+Service name, namespace, and instance ID are copied to entry labels; when a structured payload is
+needed, `service_name` is also included as its `service` field.
+
+Calls are batched to at most 1000 entries and an estimated 8 MiB, below the API's 10 MiB request
+limit; an estimated entry above 240 KiB is rejected locally before approaching Cloud Logging's
+approximate 256 KiB `LogEntry` limit. Batches use `partialSuccess: false`, so the scalar never marks
+part of a rejected batch as `ok`. Every row gets a stable timestamp and `insertId`. The sender
+retries explicit 429 rejections and failures known to happen before any bytes were sent, but does
+not retry 5xx or ambiguous connection failures whose responses may follow an accepted write. Cloud
+Logging suppresses same-timestamp/same-`insertId` duplicates in query results, but does not
+guarantee de-duplication in exports.
+
+The sender uses the same `ENDPOINT`, TLS, quota-project, token refresh, timeout, retry, cancellation,
+and browser proxy behavior as the reader. Service-account tokens request `logging.write`; ADC user
+credentials retain the scopes granted by `gcloud auth application-default login`.
 
 ## Service dependencies
 
@@ -208,6 +259,7 @@ a logs-only query never asks for monitoring authority.
 
 [policies]: https://cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.alertPolicies/list
 [alerts-list]: https://cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.alerts/list
+[entries-write]: https://cloud.google.com/logging/docs/reference/v2/rest/v2/entries/write
 
 ## Mapping to OTLP
 

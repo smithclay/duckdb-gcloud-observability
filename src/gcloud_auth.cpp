@@ -36,6 +36,7 @@ using namespace duckdb_yyjson; // NOLINT
 namespace duckdb {
 
 const char *const kLoggingReadScope = "https://www.googleapis.com/auth/logging.read";
+const char *const kLoggingWriteScope = "https://www.googleapis.com/auth/logging.write";
 const char *const kMonitoringReadScope = "https://www.googleapis.com/auth/monitoring.read";
 const char *const kCloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform";
 
