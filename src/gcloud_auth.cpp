@@ -37,6 +37,7 @@ namespace duckdb {
 
 const char *const kLoggingReadScope = "https://www.googleapis.com/auth/logging.read";
 const char *const kMonitoringReadScope = "https://www.googleapis.com/auth/monitoring.read";
+const char *const kCloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform";
 
 //! Google's public OAuth2 token endpoint. Credentials files normally carry their own `token_uri`;
 //! this is the fallback when they do not.

@@ -14,6 +14,9 @@ extern const char *const kLoggingReadScope;
 //! versa); the token cache is keyed by scope, so the two coexist.
 extern const char *const kMonitoringReadScope;
 
+//! App Topology's generated topology method accepts the general Cloud Platform scope.
+extern const char *const kCloudPlatformScope;
+
 //! How to obtain an OAuth2 bearer token for the Cloud Logging API. Exactly one of `token` (an
 //! already-minted access token) or a credentials JSON file is used; when both are empty the file is
 //! discovered the way every Google client library does it (Application Default Credentials).

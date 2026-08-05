@@ -16,6 +16,11 @@ SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_gcloud_
 ----
 true
 
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_gcloud_service_dependencies';
+----
+true
+
 # The custom secret type works with Application Default Credentials (no token, no key file).
 statement ok
 CREATE SECRET gcloud_adc (
@@ -150,6 +155,36 @@ SELECT * FROM read_gcloud_logs(project => 'my-project', bogus_param => 10);
 ----
 Invalid named parameter
 
+# App Topology binding is offline and exposes the canonical cross-provider service-edge schema.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_gcloud_service_dependencies(project => 'my-project'));
+----
+17
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_gcloud_service_dependencies(project => 'my-project'))
+WHERE column_name IN ('provider', 'source_service', 'target_service', 'source_type', 'target_type', 'edge_type',
+                      'environment', 'window_start', 'window_end', 'request_count', 'error_count', 'fault_count',
+                      'throttle_count', 'total_response_time_seconds', 'source_attributes', 'target_attributes',
+                      'edge_attributes');
+----
+17
+
+statement error
+SELECT * FROM read_gcloud_service_dependencies(project => 'my-project', retries => -1);
+----
+retries must be between 0 and 100
+
+statement error
+SELECT * FROM read_gcloud_service_dependencies(project => 'my-project', timeout => 0);
+----
+timeout must be >= 1 second
+
+statement error
+SELECT * FROM read_gcloud_service_dependencies(project => 'my-project', max_rows => -1);
+----
+max_rows must be >= 0
+
 # ---------------------------------------------------------------------------
 # Conservative WHERE pushdown
 # ---------------------------------------------------------------------------
@@ -237,7 +272,7 @@ physical_plan	<!REGEX>:.*Google Cloud Filter.*
 statement ok
 ATTACH 'gcloud:' AS gcp (TYPE gcloud, PROJECT 'my-project', START_TIME '-1h');
 
-# One log table plus the two Cloud Monitoring alert tables.
+# One log table, two Cloud Monitoring alert tables, and one App Topology service-map table.
 query II
 SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'gcp'
 ORDER BY table_schema, table_name;
@@ -245,6 +280,7 @@ ORDER BY table_schema, table_name;
 alerts	open
 alerts	policies
 logs	entries
+service_map	dependencies
 
 # The catalog log table carries the same 18-column OTLP schema as the reader.
 query I
@@ -271,6 +307,11 @@ query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM gcp.alerts.policies);
 ----
 11
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM gcp.service_map.dependencies);
+----
+17
 
 # Pushdown applies to catalog tables too, ANDed onto the attachment's own time bound.
 query II

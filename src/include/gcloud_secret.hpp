@@ -32,6 +32,8 @@ struct GcloudCredentials {
 	//! different hosts, so one override cannot stand in for both. Empty => derive from
 	//! `universe_domain`.
 	string monitoring_endpoint;
+	//! Full override of the App Topology gRPC API base. Empty => derive from `universe_domain`.
+	string app_topology_endpoint;
 	//! Skip TLS certificate/hostname verification. Must stay false against real Google endpoints.
 	bool insecure_tls = false;
 };
@@ -55,5 +57,8 @@ string GcloudLoggingEndpoint(const GcloudCredentials &credentials);
 //! Base URL for the Cloud Monitoring API implied by `credentials` (`monitoring_endpoint` wins over
 //! `universe_domain`), with any trailing '/' removed.
 string GcloudMonitoringEndpoint(const GcloudCredentials &credentials);
+
+//! Base URL for the App Topology API (`app_topology_endpoint` wins over `universe_domain`).
+string GcloudAppTopologyEndpoint(const GcloudCredentials &credentials);
 
 } // namespace duckdb

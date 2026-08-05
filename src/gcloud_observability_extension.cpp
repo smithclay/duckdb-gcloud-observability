@@ -5,6 +5,7 @@
 #include "gcloud_catalog.hpp"
 #include "gcloud_secret.hpp"
 #include "logs_table.hpp"
+#include "service_dependencies_table.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -19,6 +20,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Catalog: ATTACH 'gcloud:' AS gcp (TYPE gcloud, PROJECT '...').
 	RegisterGcloudCatalog(loader);
 	RegisterGcloudLogsFunction(loader);
+	// App Topology: SELECT * FROM read_gcloud_service_dependencies(project => '...').
+	RegisterGcloudServiceDependenciesFunction(loader);
 }
 
 void GcloudObservabilityExtension::Load(ExtensionLoader &loader) {

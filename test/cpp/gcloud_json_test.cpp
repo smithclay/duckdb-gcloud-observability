@@ -1,5 +1,7 @@
 #include "gcloud_json.hpp"
+#include "gcloud_topology.hpp"
 
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 
@@ -9,6 +11,80 @@ static void Require(bool condition, const char *message) {
 	if (!condition) {
 		throw std::runtime_error(message);
 	}
+}
+
+static void PutTestVarint(string &out, uint64_t value) {
+	while (value >= 0x80) {
+		out.push_back(static_cast<char>((value & 0x7f) | 0x80));
+		value >>= 7;
+	}
+	out.push_back(static_cast<char>(value));
+}
+
+static void PutTestBytes(string &out, uint32_t field, const string &value) {
+	PutTestVarint(out, (static_cast<uint64_t>(field) << 3) | 2);
+	PutTestVarint(out, value.size());
+	out += value;
+}
+
+static string TestStringValue(const string &value) {
+	string result;
+	PutTestBytes(result, 3, value);
+	return result;
+}
+
+static string TestDoubleValue(double value) {
+	uint64_t bits = 0;
+	memcpy(&bits, &value, sizeof(bits));
+	string result;
+	PutTestVarint(result, (uint64_t(2) << 3) | 1);
+	for (idx_t i = 0; i < 8; i++) {
+		result.push_back(static_cast<char>((bits >> (8 * i)) & 0xff));
+	}
+	return result;
+}
+
+static void PutTestProperty(string &proto_struct, const string &key, const string &value) {
+	string entry;
+	PutTestBytes(entry, 1, key);
+	PutTestBytes(entry, 2, TestStringValue(value));
+	PutTestBytes(proto_struct, 1, entry);
+}
+
+static string TestNode(const string &id, const string &display_name, const string &environment) {
+	string properties;
+	PutTestProperty(properties, "Base/displayName", display_name);
+	PutTestProperty(properties, "Base/environment", environment);
+	PutTestProperty(properties, "Base/resourceType", "k8s.io/Service");
+	string node;
+	PutTestBytes(node, 3, properties);
+	PutTestBytes(node, 4, id);
+	PutTestBytes(node, 5, "Base/Resource");
+	PutTestBytes(node, 5, "Base/DiscoveredService");
+	PutTestBytes(node, 5, "Base/k8s.io/Service");
+	return node;
+}
+
+static string TestTopologyResponse() {
+	string edge_properties;
+	string error_rate_entry;
+	PutTestBytes(error_rate_entry, 1, "Observability/errorRate");
+	PutTestBytes(error_rate_entry, 2, TestDoubleValue(0.25));
+	PutTestBytes(edge_properties, 1, error_rate_entry);
+
+	string edge;
+	PutTestBytes(edge, 5, edge_properties);
+	PutTestBytes(edge, 6, "//gke/services/checkout");
+	PutTestBytes(edge, 7, "//gke/services/payment");
+	PutTestBytes(edge, 8, "Observability/SENDS_TRAFFIC");
+
+	string topology;
+	PutTestBytes(topology, 1, TestNode("//gke/services/checkout", "checkout", "prod"));
+	PutTestBytes(topology, 1, TestNode("//gke/services/payment", "payment", "prod"));
+	PutTestBytes(topology, 2, edge);
+	string response;
+	PutTestBytes(response, 1, topology);
+	return response;
 }
 
 int main() {
@@ -91,6 +167,36 @@ int main() {
 		Require(BuildGcloudListBody({"projects/p"}, "", "timestamp asc", 1, "abc").find("\"pageToken\":\"abc\"") !=
 		            string::npos,
 		        "a non-empty cursor should be sent as pageToken");
+
+		//===------------------------------------------------------------===//
+		// App Topology protobuf
+		//===------------------------------------------------------------===//
+		auto topology_request = BuildGcloudServiceDependenciesRequest("my-project");
+		Require(topology_request.find("projects/my-project/locations/global/discoveredResourcesTopology") !=
+		            string::npos,
+		        "the topology request should be project-scoped");
+		Require(topology_request.find("projects/my-project/locations/global/domains/SRE") != string::npos,
+		        "service traffic should query the SRE topology domain");
+		Require(topology_request.find("Base/DiscoveredService") != string::npos,
+		        "the graph endpoints should match discovered services");
+		Require(topology_request.find("Observability/SENDS_TRAFFIC") != string::npos,
+		        "the graph should request traffic edges rather than scanning spans");
+
+		auto dependencies = ParseGcloudServiceDependenciesResponse(TestTopologyResponse());
+		Require(dependencies.size() == 1, "one protobuf topology edge should become one dependency row");
+		Require(dependencies[0].source_service == "checkout" && dependencies[0].target_service == "payment",
+		        "display names should identify both ends of the dependency");
+		Require(dependencies[0].source_type == "k8s.io/Service" && dependencies[0].target_type == "k8s.io/Service",
+		        "the most specific node label should become the canonical service type");
+		Require(dependencies[0].edge_type == "sends traffic to",
+		        "the provider edge label should map to its documented relationship name");
+		Require(dependencies[0].environment == "prod", "the source service environment should be retained");
+		Require(dependencies[0].source_attributes.find("_app_topology_id") != string::npos,
+		        "node attributes should retain the provider resource id");
+		Require(dependencies[0].edge_attributes.find("0.25") != string::npos,
+		        "traffic relationship properties should be preserved as JSON");
+		Require(ParseGcloudServiceDependenciesResponse(string()).empty(),
+		        "an empty topology response should produce no dependency rows");
 
 		//===------------------------------------------------------------===//
 		// Row budget

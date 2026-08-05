@@ -3,6 +3,14 @@
                 {
                         "name": "openssl",
                         "platform": "!emscripten"
+                },
+                {
+                        "name": "curl",
+                        "features": [
+                                "http2",
+                                "ssl"
+                        ],
+                        "platform": "!emscripten"
                 }
         ],
         "vcpkg-configuration": {
