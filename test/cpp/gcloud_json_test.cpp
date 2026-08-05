@@ -1,6 +1,9 @@
+#include "gcloud_auth.hpp"
 #include "gcloud_json.hpp"
 #include "gcloud_topology.hpp"
 #include "send_logs.hpp"
+
+#include "duckdb/common/exception.hpp"
 
 #include <cstring>
 #include <iostream>
@@ -102,6 +105,9 @@ int main() {
 		Require(!ParseRfc3339ToNanos(nullptr, nanos), "a null timestamp should be rejected");
 
 		Require(FormatRfc3339(0) == "1970-01-01T00:00:00Z", "epoch seconds should format as RFC 3339 UTC");
+		Require(TryDiscoverServiceAccountProject("test/fixtures/gcloud_service_account_minimal.json") ==
+		            "sender-fixture-project",
+		        "an explicit service-account credentials file should supply its own destination project");
 
 		//===------------------------------------------------------------===//
 		// Severity names
@@ -217,7 +223,7 @@ int main() {
 		write_log.resource_attributes_json =
 		    R"({"cloud.resource_id":"run.googleapis.com%2Fstdout","gcp.resource_type":"cloud_run_revision","gcp.label.location":"us-west1"})";
 		write_log.log_attributes_json =
-		    R"({"log.record.uid":"stable-id","gcp.label.team":"payments","attempt":3,"message":"must-not-win"})";
+		    R"({"log.record.uid":"stable-id","gcp.label.team":"payments","gcp.label.service_name":"must-not-win","attempt":3,"message":"must-not-win"})";
 		auto write_body = BuildGcloudWriteBody({write_log});
 		Require(write_body.find(R"("partialSuccess":false)") != string::npos,
 		        "entries.write should use all-or-error batch semantics");
@@ -236,12 +242,14 @@ int main() {
 		            write_body.find(R"("traceSampled":true)") != string::npos,
 		        "trace correlation fields should map without losing the sampled flag");
 		Require(write_body.find(R"("team":"payments")") != string::npos &&
-		            write_body.find(R"("service_name":"checkout")") != string::npos,
-		        "gcp labels and service identity should become LogEntry labels");
+		            write_body.find(R"("service_name":"checkout")") != string::npos &&
+		            write_body.find(R"("service_namespace":"store")") != string::npos &&
+		            write_body.find(R"("service_instance_id":"checkout-7")") != string::npos,
+		        "gcp labels and complete service identity should become LogEntry labels");
 		Require(write_body.find(R"("message":"checkout failed")") != string::npos &&
 		            write_body.find(R"("attempt":3)") != string::npos &&
 		            write_body.find("must-not-win") == string::npos,
-		        "the body should win reserved payload keys while arbitrary log attributes are preserved");
+		        "dedicated body/service fields should win label and payload conflicts");
 		Require(EstimateGcloudWriteLogBytes(write_log) > write_log.body.size(),
 		        "the batch estimator should include escaping and envelope slack");
 
@@ -257,6 +265,30 @@ int main() {
 		Require(plain_body.find(R"("textPayload":"plain text")") != string::npos &&
 		            plain_body.find("jsonPayload") == string::npos,
 		        "a log with no custom attributes should use LogEntry textPayload");
+
+		GcloudWriteLog medium_log = plain_log;
+		medium_log.body = string(64 * 1024, 'a');
+		auto medium_body = BuildGcloudWriteBody({medium_log});
+		Require(medium_body.size() > 64 * 1024,
+		        "an ordinary medium ASCII log should serialize instead of being rejected by worst-case escaping");
+
+		bool malformed_attributes_rejected = false;
+		try {
+			plain_log.log_attributes_json = "not-json";
+			BuildGcloudWriteBody({plain_log});
+		} catch (const InvalidInputException &) {
+			malformed_attributes_rejected = true;
+		}
+		Require(malformed_attributes_rejected, "malformed non-empty log_attributes must not be silently dropped");
+		bool non_object_attributes_rejected = false;
+		try {
+			plain_log.log_attributes_json.clear();
+			plain_log.resource_attributes_json = "[]";
+			BuildGcloudWriteBody({plain_log});
+		} catch (const InvalidInputException &) {
+			non_object_attributes_rejected = true;
+		}
+		Require(non_object_attributes_rejected, "non-object resource_attributes must not be silently dropped");
 
 		//===------------------------------------------------------------===//
 		// Row budget

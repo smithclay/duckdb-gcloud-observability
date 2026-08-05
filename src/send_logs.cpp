@@ -32,7 +32,6 @@ namespace {
 //! the request envelope; 1000 entries also keeps vector-sized calls and API resource fanout bounded.
 static constexpr idx_t GCLOUD_WRITE_MAX_BATCH = 1000;
 static constexpr idx_t GCLOUD_WRITE_MAX_BATCH_BYTES = 8 * 1024 * 1024;
-static constexpr idx_t GCLOUD_WRITE_MAX_ENTRY_BYTES = 240 * 1024;
 
 struct SendLogsFieldIndices {
 	int32_t body = -1;
@@ -108,16 +107,33 @@ static int32_t PickField(const std::unordered_map<string, idx_t> &by_name, const
 
 static string ResolveProject(const GcloudCredentials &credentials) {
 	auto project = credentials.project;
-	if (project.empty()) {
-		project = TryDiscoverAdcProject();
+	if (!project.empty()) {
+		return project;
 	}
-	if (project.empty()) {
-		throw InvalidInputException("send_gcloud_logs: no Google Cloud project configured. Store it in a secret:\n"
-		                            "  CREATE SECRET (TYPE gcloud, PROJECT 'my-project');\n"
-		                            "or configure the ADC quota project:\n"
-		                            "  gcloud auth application-default set-quota-project my-project");
+	// A static token has no trustworthy project identity. In particular, never borrow the process
+	// ADC quota project: that can authenticate one principal and silently write to another project.
+	if (!credentials.token.empty()) {
+		throw InvalidInputException(
+		    "send_gcloud_logs: a gcloud secret with TOKEN must also set PROJECT; the process ADC project "
+		    "is not used with explicitly selected credentials");
 	}
-	return project;
+	if (!credentials.credentials_file.empty()) {
+		project = TryDiscoverServiceAccountProject(credentials.credentials_file);
+		if (!project.empty()) {
+			return project;
+		}
+		throw InvalidInputException(
+		    "send_gcloud_logs: CREDENTIALS does not identify a service-account project; set PROJECT explicitly "
+		    "when using this credentials file");
+	}
+	project = TryDiscoverAdcProject();
+	if (!project.empty()) {
+		return project;
+	}
+	throw InvalidInputException("send_gcloud_logs: no Google Cloud project configured. Store it in a secret:\n"
+	                            "  CREATE SECRET (TYPE gcloud, PROJECT 'my-project');\n"
+	                            "or configure the ADC quota project:\n"
+	                            "  gcloud auth application-default set-quota-project my-project");
 }
 
 static unique_ptr<FunctionData> GcloudSendLogsBind(ClientContext &context, ScalarFunction &bound_function,
@@ -296,6 +312,17 @@ static string ReadJsonStringAttribute(const string &json, const char *key) {
 	return value ? string(value) : string();
 }
 
+static void ValidateAttributesJson(const string &json, const char *field_name) {
+	if (json.empty()) {
+		return;
+	}
+	YyjsonDocPtr doc(yyjson_read(json.c_str(), json.size(), 0));
+	auto *root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
+	if (!root || !yyjson_is_obj(root)) {
+		throw InvalidInputException("send_gcloud_logs: %s must be a valid JSON object", field_name);
+	}
+}
+
 static GcloudWriteLog BuildWriteLog(const SendLogsFieldIndices &fields, vector<unique_ptr<Vector>> &children, idx_t row,
                                     const string &project) {
 	GcloudWriteLog log;
@@ -319,6 +346,11 @@ static GcloudWriteLog BuildWriteLog(const SendLogsFieldIndices &fields, vector<u
 	log.resource_type = ReadStringField(children, fields.resource_type, row);
 	log.resource_attributes_json = ReadStringField(children, fields.resource_attributes, row);
 	log.log_attributes_json = ReadStringField(children, fields.log_attributes, row);
+	// Validate the whole input chunk before the first batch is sent. Silently discarding malformed
+	// attributes would return `ok` after losing caller data, while discovering them batch-by-batch
+	// could write an earlier batch before a later row fails.
+	ValidateAttributesJson(log.resource_attributes_json, "resource_attributes");
+	ValidateAttributesJson(log.log_attributes_json, "log_attributes");
 	if (!ReadTimestampNanos(children, fields.timestamp, fields.timestamp_is_nanos, row, log.timestamp_nanos) &&
 	    !ReadTimestampNanos(children, fields.observed_timestamp, true, row, log.timestamp_nanos)) {
 		log.timestamp_nanos =
@@ -375,11 +407,6 @@ static void GcloudSendLogsFunction(DataChunk &args, ExpressionState &state, Vect
 		idx_t batch_bytes = 0;
 		while (batch_end < logs.size() && batch_end - offset < GCLOUD_WRITE_MAX_BATCH) {
 			auto next_bytes = EstimateGcloudWriteLogBytes(logs[batch_end]);
-			if (next_bytes > GCLOUD_WRITE_MAX_ENTRY_BYTES) {
-				throw InvalidInputException(
-				    "send_gcloud_logs: row %llu is too large for Cloud Logging's 256 KiB LogEntry limit",
-				    static_cast<unsigned long long>(source_rows[batch_end]));
-			}
 			if (batch_end > offset && batch_bytes + next_bytes > GCLOUD_WRITE_MAX_BATCH_BYTES) {
 				break;
 			}
@@ -395,13 +422,13 @@ static void GcloudSendLogsFunction(DataChunk &args, ExpressionState &state, Vect
 	}
 }
 
-static YyjsonDocPtr ParseAttributes(const string &json) {
+static YyjsonDocPtr ParseAttributes(const string &json, const char *field_name) {
 	if (json.empty()) {
 		return YyjsonDocPtr();
 	}
 	YyjsonDocPtr doc(yyjson_read(json.c_str(), json.size(), 0));
 	if (!doc || !yyjson_is_obj(yyjson_doc_get_root(doc.get()))) {
-		return YyjsonDocPtr();
+		throw InvalidInputException("send_gcloud_logs: %s must be a valid JSON object", field_name);
 	}
 	return doc;
 }
@@ -523,8 +550,8 @@ string BuildGcloudWriteBody(const GcloudWriteLog *logs, idx_t count) {
 
 	for (idx_t i = 0; i < count; i++) {
 		const auto &log = logs[i];
-		auto resource_doc = ParseAttributes(log.resource_attributes_json);
-		auto log_doc = ParseAttributes(log.log_attributes_json);
+		auto resource_doc = ParseAttributes(log.resource_attributes_json, "resource_attributes");
+		auto log_doc = ParseAttributes(log.log_attributes_json, "log_attributes");
 		auto *resource_attributes = resource_doc ? yyjson_doc_get_root(resource_doc.get()) : nullptr;
 		auto *log_attributes = log_doc ? yyjson_doc_get_root(log_doc.get()) : nullptr;
 
@@ -583,10 +610,12 @@ string BuildGcloudWriteBody(const GcloudWriteLog *logs, idx_t count) {
 
 		auto *labels = yyjson_mut_obj(doc.get());
 		yyjson_mut_obj_add(entry, yyjson_mut_strcpy(doc.get(), "labels"), labels);
-		PutStringLabels(doc.get(), labels, log_attributes, "gcp.label.");
+		// Dedicated columns win provider-attribute collisions. Add them first so PutStringLabels'
+		// existing-key guard also prevents duplicate JSON keys.
 		GcloudPutStr(doc.get(), labels, "service_name", log.service_name.c_str());
 		GcloudPutStr(doc.get(), labels, "service_namespace", log.service_namespace.c_str());
 		GcloudPutStr(doc.get(), labels, "service_instance_id", log.service_instance_id.c_str());
+		PutStringLabels(doc.get(), labels, log_attributes, "gcp.label.");
 
 		if (HasPayloadAttributes(log_attributes)) {
 			// Structured payload preserves arbitrary OTLP log attributes. Dedicated row fields win over

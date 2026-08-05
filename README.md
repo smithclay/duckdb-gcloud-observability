@@ -120,14 +120,22 @@ an explicit `log_name` in that project can select another log. `/` in a raw log 
 Service name, namespace, and instance ID are copied to entry labels; when a structured payload is
 needed, `service_name` is also included as its `service` field.
 
-Calls are batched to at most 1000 entries and an estimated 8 MiB, below the API's 10 MiB request
-limit; an estimated entry above 240 KiB is rejected locally before approaching Cloud Logging's
-approximate 256 KiB `LogEntry` limit. Batches use `partialSuccess: false`, so the scalar never marks
-part of a rejected batch as `ok`. Every row gets a stable timestamp and `insertId`. The sender
-retries explicit 429 rejections and failures known to happen before any bytes were sent, but does
-not retry 5xx or ambiguous connection failures whose responses may follow an accepted write. Cloud
-Logging suppresses same-timestamp/same-`insertId` duplicates in query results, but does not
-guarantee de-duplication in exports.
+Project inference follows the selected authentication source. An explicit `PROJECT` always wins;
+an explicit service-account `CREDENTIALS` file can supply its own `project_id`; only actual ADC
+(no explicit token or credentials path) falls back to the ADC project. A `TOKEN` secret must set
+`PROJECT`, preventing an unrelated process ADC project from silently becoming the write target.
+Non-empty `resource_attributes` and `log_attributes` must be valid JSON objects; malformed values
+fail while their input chunk is mapped, before that chunk is sent, instead of being discarded.
+
+Calls are batched to at most 1000 entries and a conservative worst-case JSON-escaped estimate of
+8 MiB, below the API's 10 MiB request limit. Cloud Logging enforces its approximate 256 KiB
+per-`LogEntry` internal-size limit; the sender does not apply the JSON escaping estimate as an entry
+limit because that would reject much smaller ordinary text logs. Batches use
+`partialSuccess: false`, so the scalar never marks part of a rejected batch as `ok`. Every row gets
+a stable timestamp and `insertId`. The sender retries explicit 429 rejections and failures known to
+happen before any bytes were sent, but does not retry 5xx or ambiguous connection failures whose
+responses may follow an accepted write. Cloud Logging suppresses same-timestamp/same-`insertId`
+duplicates in query results, but does not guarantee de-duplication in exports.
 
 The sender uses the same `ENDPOINT`, TLS, quota-project, token refresh, timeout, retry, cancellation,
 and browser proxy behavior as the reader. Service-account tokens request `logging.write`; ADC user

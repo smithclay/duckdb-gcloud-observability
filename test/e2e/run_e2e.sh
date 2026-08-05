@@ -235,8 +235,10 @@ WITH to_send AS (
   SELECT current_timestamp::TIMESTAMP_NS AS time_unix_nano,
          '${SEND_TRACE_ID}' AS trace_id,
          '${SEND_SPAN_ID}' AS span_id,
-         1 AS flags,
-         'duckdb-gcloud-sender' AS service_name,
+	         1 AS flags,
+	         'duckdb-gcloud-sender' AS service_name,
+	         'duckdb-e2e' AS service_namespace,
+	         'sender-1' AS service_instance_id,
          17 AS severity_number,
          'sent through send_gcloud_logs ${SEND_MARKER}' AS body,
          '${LOG_ID}' AS log_id,
@@ -270,7 +272,9 @@ fi
 
 send_checks="$(run_duckdb_scalar "
 SELECT count(*) >= 1
-   AND bool_and(service_name = 'duckdb-gcloud-sender')
+	   AND bool_and(service_name = 'duckdb-gcloud-sender')
+	   AND bool_and(service_namespace = 'duckdb-e2e')
+	   AND bool_and(service_instance_id = 'sender-1')
    AND bool_and(severity_text = 'ERROR')
    AND bool_and(trace_id = '${SEND_TRACE_ID}')
    AND bool_and(span_id = '${SEND_SPAN_ID}')
@@ -280,7 +284,7 @@ SELECT count(*) >= 1
 FROM ${SEND_READ_SQL};
 " | tr -d '[:space:]')"
 [ "${send_checks}" = "true" ] || fail "send/read round-trip field assertions failed (got '${send_checks}')"
-ok "send_gcloud_logs round-trip preserves service, severity, body, trace/span, flags, and labels"
+ok "send_gcloud_logs round-trip preserves service identity, severity, body, trace/span, flags, and labels"
 
 log "Sample row:"
 printf '%s\n' "${assert_out}" | sed -n '/---SAMPLE---/,/---RESOURCEATTRS---/p' | sed '1d;$d'

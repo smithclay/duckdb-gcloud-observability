@@ -35,8 +35,8 @@ inline string BuildGcloudWriteBody(const vector<GcloudWriteLog> &logs) {
 	return BuildGcloudWriteBody(logs.data(), logs.size());
 }
 
-//! Conservative serialized-size estimate used to keep requests below Cloud Logging's 10 MiB
-//! entries.write limit. The sender uses a lower 8 MiB cap for escaping and envelope slack.
+//! Conservative worst-case JSON-escaped size used to keep requests below Cloud Logging's 10 MiB
+//! entries.write limit. It is a batching estimate, not a per-entry rejection threshold.
 idx_t EstimateGcloudWriteLogBytes(const GcloudWriteLog &log);
 
 //! Register `send_gcloud_logs(struct [, secret])`. The first argument is normally a whole row from

@@ -55,6 +55,32 @@ CREATE SECRET gcloud_key (
     QUOTA_PROJECT 'billing-project'
 );
 
+# An explicitly selected service-account file supplies its own project_id; sender binding must not
+# borrow the unrelated process ADC project.
+statement ok
+CREATE SECRET gcloud_key_inferred_project (
+    TYPE gcloud,
+    CREDENTIALS '{WORKING_DIR}/test/fixtures/gcloud_service_account_minimal.json'
+);
+
+query I
+SELECT column_type = 'VARCHAR'
+FROM (DESCRIBE SELECT send_gcloud_logs({'body': 'hi'}, 'gcloud_key_inferred_project'));
+----
+true
+
+# A static token carries no trustworthy destination project and must never borrow process ADC.
+statement ok
+CREATE SECRET gcloud_token_without_project (
+    TYPE gcloud,
+    TOKEN 'TOKEN_WITHOUT_PROJECT'
+);
+
+statement error
+DESCRIBE SELECT send_gcloud_logs({'body': 'hi'}, 'gcloud_token_without_project');
+----
+with TOKEN must also set PROJECT
+
 # TOKEN is redacted, never shown in duckdb_secrets().
 query I
 SELECT secret_string NOT LIKE '%SECRET_TOKEN_VALUE%' FROM duckdb_secrets() WHERE name = 'gcloud_token';
@@ -81,6 +107,18 @@ query I
 SELECT send_gcloud_logs(NULL::STRUCT(body VARCHAR), 'gcloud_adc') IS NULL;
 ----
 true
+
+# Non-empty attribute values are caller data: malformed JSON and non-object JSON fail before any
+# request rather than returning ok after silently dropping them.
+statement error
+SELECT send_gcloud_logs({'body': 'hi', 'resource_attributes': 'not-json'}, 'gcloud_token');
+----
+resource_attributes must be a valid JSON object
+
+statement error
+SELECT send_gcloud_logs({'body': 'hi', 'log_attributes': '[]'}, 'gcloud_token');
+----
+log_attributes must be a valid JSON object
 
 statement error
 DESCRIBE SELECT send_gcloud_logs('not a struct', 'gcloud_adc');

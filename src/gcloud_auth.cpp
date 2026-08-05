@@ -169,6 +169,27 @@ string TryDiscoverAdcProject() {
 	return string();
 }
 
+string TryDiscoverServiceAccountProject(const string &credentials_file) {
+	if (credentials_file.empty()) {
+		return string();
+	}
+	std::ifstream stream(credentials_file, std::ios::in | std::ios::binary);
+	if (!stream) {
+		return string();
+	}
+	std::ostringstream buffer;
+	buffer << stream.rdbuf();
+	auto contents = buffer.str();
+	YyjsonDocPtr doc(yyjson_read(contents.c_str(), contents.size(), 0));
+	auto *root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
+	const char *type = GetStr(root, "type");
+	if (!type || strcmp(type, "service_account") != 0) {
+		return string();
+	}
+	const char *project = GetStr(root, "project_id");
+	return project && *project ? string(project) : string();
+}
+
 static string ReadWholeFile(const string &path) {
 	std::ifstream stream(path, std::ios::in | std::ios::binary);
 	if (!stream) {
@@ -532,6 +553,10 @@ string DiscoverAdcPath() {
 
 string TryDiscoverAdcProject() {
 	return string(); // Same: the project must be given explicitly in a browser.
+}
+
+string TryDiscoverServiceAccountProject(const string &) {
+	return string(); // Browser builds cannot read an explicit credentials file.
 }
 
 void InvalidateGcloudTokenCache(const GcloudAuthConfig &) {

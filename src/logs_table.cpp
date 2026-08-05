@@ -442,11 +442,15 @@ static void MapEntry(yyjson_val *entry, const vector<column_t> &column_ids, vect
 		case COL_SERVICE_NAMESPACE:
 			if (const char *namespace_name = GcloudLookupStr({resource_labels}, {"namespace_name", "namespace_id"})) {
 				row[c] = Value(string(namespace_name));
+			} else if (const char *namespace_name = GcloudLookupStr({labels}, {"service_namespace"})) {
+				row[c] = Value(string(namespace_name));
 			}
 			break;
 		case COL_SERVICE_INSTANCE_ID:
 			if (const char *instance =
 			        GcloudLookupStr({resource_labels}, {"instance_id", "pod_name", "revision_name", "task_id"})) {
+				row[c] = Value(string(instance));
+			} else if (const char *instance = GcloudLookupStr({labels}, {"service_instance_id"})) {
 				row[c] = Value(string(instance));
 			}
 			break;

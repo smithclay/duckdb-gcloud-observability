@@ -69,6 +69,11 @@ string DiscoverAdcPath();
 //! never throws, since this only supplies a default the user may override.
 string TryDiscoverAdcProject();
 
+//! Best-effort project inferred from an explicitly selected service-account credentials file.
+//! Returns its `project_id` only when the file is readable JSON with `type=service_account`; user
+//! credential quota projects are deliberately not treated as write destinations.
+string TryDiscoverServiceAccountProject(const string &credentials_file);
+
 //! Mint (or return a cached) OAuth2 access token for `config`.
 //!
 //! For `authorized_user` credentials this performs the refresh-token grant; for `service_account`
