@@ -238,6 +238,15 @@ bool GcloudLogsMaxRowsReached(int64_t max_rows, idx_t total_emitted) {
 	return max_rows > 0 && total_emitted >= static_cast<idx_t>(max_rows);
 }
 
+bool AdvanceGcloudPageToken(const string &next_page_token, unordered_set<string> &seen_page_tokens,
+                            string &page_token) {
+	if (next_page_token.empty() || !seen_page_tokens.insert(next_page_token).second) {
+		return false;
+	}
+	page_token = next_page_token;
+	return true;
+}
+
 //===--------------------------------------------------------------------===//
 // Cloud Monitoring alerts
 //===--------------------------------------------------------------------===//
@@ -276,7 +285,7 @@ static string BuildAlertsPath(const string &project, const char *collection, con
 }
 
 string BuildGcloudOpenAlertsPath(const string &project, int64_t page_size, const string &page_token) {
-	return BuildAlertsPath(project, "alerts", "state=open", page_size, page_token);
+	return BuildAlertsPath(project, "alerts", "state=OPEN", page_size, page_token);
 }
 
 string BuildGcloudAlertPoliciesPath(const string &project, int64_t page_size, const string &page_token) {
@@ -324,6 +333,8 @@ GcloudAlertsPage ParseGcloudAlertsPage(const string &response_json) {
 			}
 			GcloudAlert alert;
 			if (const char *name = GcloudGetStr(item, "name")) {
+				alert.has_alert_name = true;
+				alert.alert_name = name;
 				alert.has_incident_id = true;
 				alert.incident_id = LastPathSegment(string(name));
 			}
@@ -344,6 +355,13 @@ GcloudAlertsPage ParseGcloudAlertsPage(const string &response_json) {
 					alert.has_policy_name = true;
 					alert.policy_name = policy_name;
 				}
+				if (const char *severity = GcloudGetStr(policy, "severity")) {
+					alert.has_policy_severity = true;
+					alert.policy_severity = severity;
+				}
+				if (yyjson_val *labels = GcloudLookupObj(policy, "userLabels", "user_labels")) {
+					alert.policy_user_labels = GcloudWriteValue(labels);
+				}
 			}
 			if (yyjson_val *resource = GcloudGetObj(item, "resource")) {
 				if (const char *type = GcloudGetStr(resource, "type")) {
@@ -352,6 +370,28 @@ GcloudAlertsPage ParseGcloudAlertsPage(const string &response_json) {
 				}
 				if (yyjson_val *labels = GcloudGetObj(resource, "labels")) {
 					alert.resource_labels = GcloudWriteValue(labels);
+				}
+			}
+			if (yyjson_val *metadata = GcloudGetObj(item, "metadata")) {
+				if (yyjson_val *labels = GcloudLookupObj(metadata, "systemLabels", "system_labels")) {
+					alert.resource_system_labels = GcloudWriteValue(labels);
+				}
+				if (yyjson_val *labels = GcloudLookupObj(metadata, "userLabels", "user_labels")) {
+					alert.resource_user_labels = GcloudWriteValue(labels);
+				}
+			}
+			if (yyjson_val *metric = GcloudGetObj(item, "metric")) {
+				if (const char *type = GcloudGetStr(metric, "type")) {
+					alert.has_metric_type = true;
+					alert.metric_type = type;
+				}
+				if (yyjson_val *labels = GcloudGetObj(metric, "labels")) {
+					alert.metric_labels = GcloudWriteValue(labels);
+				}
+			}
+			if (yyjson_val *log = GcloudGetObj(item, "log")) {
+				if (yyjson_val *labels = GcloudLookupObj(log, "extractedLabels", "extracted_labels")) {
+					alert.log_extracted_labels = GcloudWriteValue(labels);
 				}
 			}
 			alert.has_opened_at = ReadTimestampField(item, "openTime", "open_time", alert.opened_at_nanos);
