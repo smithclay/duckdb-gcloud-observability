@@ -36,6 +36,7 @@ using namespace duckdb_yyjson; // NOLINT
 namespace duckdb {
 
 const char *const kLoggingReadScope = "https://www.googleapis.com/auth/logging.read";
+const char *const kLoggingWriteScope = "https://www.googleapis.com/auth/logging.write";
 const char *const kMonitoringReadScope = "https://www.googleapis.com/auth/monitoring.read";
 const char *const kCloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform";
 
@@ -166,6 +167,27 @@ string TryDiscoverAdcProject() {
 		return string(project);
 	}
 	return string();
+}
+
+string TryDiscoverServiceAccountProject(const string &credentials_file) {
+	if (credentials_file.empty()) {
+		return string();
+	}
+	std::ifstream stream(credentials_file, std::ios::in | std::ios::binary);
+	if (!stream) {
+		return string();
+	}
+	std::ostringstream buffer;
+	buffer << stream.rdbuf();
+	auto contents = buffer.str();
+	YyjsonDocPtr doc(yyjson_read(contents.c_str(), contents.size(), 0));
+	auto *root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
+	const char *type = GetStr(root, "type");
+	if (!type || strcmp(type, "service_account") != 0) {
+		return string();
+	}
+	const char *project = GetStr(root, "project_id");
+	return project && *project ? string(project) : string();
 }
 
 static string ReadWholeFile(const string &path) {
@@ -531,6 +553,10 @@ string DiscoverAdcPath() {
 
 string TryDiscoverAdcProject() {
 	return string(); // Same: the project must be given explicitly in a browser.
+}
+
+string TryDiscoverServiceAccountProject(const string &) {
+	return string(); // Browser builds cannot read an explicit credentials file.
 }
 
 void InvalidateGcloudTokenCache(const GcloudAuthConfig &) {

@@ -3,8 +3,8 @@
 # End-to-end test for the duckdb-gcloud-observability extension.
 #
 # It proves the full round trip against real Google Cloud Logging:
-#   build -> `gcloud logging write` of a uniquely-marked entry -> Cloud Logging entries.list
-#   -> read_gcloud_logs -> OTLP-shaped DuckDB rows.
+#   build -> CLI write/read mapping check -> send_gcloud_logs -> Cloud Logging entries.list
+#   -> read_gcloud_logs, including trace/span/service round-trip.
 #
 # Unlike the sibling duckdb-splunk / duckdb-datadog e2e scripts there is no local container to
 # start: Google publishes no Cloud Logging emulator, so this talks to a real project. It writes a
@@ -221,6 +221,70 @@ ok "projection pushdown: bare count(*) returns ${projected}"
 capped="$(run_duckdb_scalar "SELECT count(*) FROM read_gcloud_logs(project => '${PROJECT}', start_time => '-15m', max_rows => 1);" | tr -d '[:space:]')"
 [ "${capped}" = "1" ] || fail "max_rows => 1 returned '${capped}' rows, expected 1"
 ok "max_rows caps the scan at 1 row"
+
+# ---------------------------------------------------------------------------
+# 5. Send through the extension and read the entry back
+# ---------------------------------------------------------------------------
+SEND_MARKER="duckdbsend-$(date +%s)-${RANDOM}"
+SEND_TRACE_ID="$(printf '%032x' "$((RANDOM * RANDOM))")"
+SEND_SPAN_ID="$(printf '%016x' "$((RANDOM * RANDOM))")"
+log "Sending an OTLP-shaped row through send_gcloud_logs (marker '${SEND_MARKER}')..."
+send_result="$(run_duckdb_scalar "
+CREATE TEMP SECRET gcloud_e2e (TYPE gcloud, PROJECT '${PROJECT}');
+WITH to_send AS (
+  SELECT current_timestamp::TIMESTAMP_NS AS time_unix_nano,
+         '${SEND_TRACE_ID}' AS trace_id,
+         '${SEND_SPAN_ID}' AS span_id,
+	         1 AS flags,
+	         'duckdb-gcloud-sender' AS service_name,
+	         'duckdb-e2e' AS service_namespace,
+	         'sender-1' AS service_instance_id,
+         17 AS severity_number,
+         'sent through send_gcloud_logs ${SEND_MARKER}' AS body,
+         '${LOG_ID}' AS log_id,
+         '{\"gcp.resource_type\":\"global\"}' AS resource_attributes,
+         '{\"marker\":\"${SEND_MARKER}\",\"gcp.label.sender\":\"duckdb-extension\"}' AS log_attributes
+)
+SELECT send_gcloud_logs(t, 'gcloud_e2e') FROM to_send t;
+" | tail -n1 | tr -d '[:space:]')"
+[ "${send_result}" = "ok" ] || fail "send_gcloud_logs did not return 'ok' (got '${send_result:-<empty>}')"
+ok "send_gcloud_logs accepted the row"
+
+SEND_FILTER="logName=\"projects/${PROJECT}/logs/${LOG_ID}\" AND jsonPayload.marker=\"${SEND_MARKER}\""
+SEND_READ_SQL="read_gcloud_logs(project => '${PROJECT}', filter => '${SEND_FILTER}', start_time => '-15m')"
+send_count_sql="SELECT count(*) FROM ${SEND_READ_SQL};"
+elapsed=0
+send_found=0
+while [ "${elapsed}" -lt "${POLL_TIMEOUT}" ]; do
+	send_count="$(run_duckdb_scalar "${send_count_sql}" 2>/dev/null | tr -d '[:space:]')" || true
+	if [[ "${send_count}" =~ ^[0-9]+$ ]] && [ "${send_count}" -ge 1 ]; then
+		send_found=1
+		break
+	fi
+	log "  sent row not queryable yet (matches=${send_count:-0}); retrying in ${POLL_INTERVAL}s"
+	sleep "${POLL_INTERVAL}"
+	elapsed=$((elapsed + POLL_INTERVAL))
+done
+if [ "${send_found}" -ne 1 ]; then
+	run_duckdb_scalar "${send_count_sql}" || true
+	fail "row sent through send_gcloud_logs never became queryable within ${POLL_TIMEOUT}s"
+fi
+
+send_checks="$(run_duckdb_scalar "
+SELECT count(*) >= 1
+	   AND bool_and(service_name = 'duckdb-gcloud-sender')
+	   AND bool_and(service_namespace = 'duckdb-e2e')
+	   AND bool_and(service_instance_id = 'sender-1')
+   AND bool_and(severity_text = 'ERROR')
+   AND bool_and(trace_id = '${SEND_TRACE_ID}')
+   AND bool_and(span_id = '${SEND_SPAN_ID}')
+   AND bool_and(flags = 1)
+   AND bool_and(body LIKE '%${SEND_MARKER}%')
+   AND bool_and(log_attributes LIKE '%duckdb-extension%')
+FROM ${SEND_READ_SQL};
+" | tr -d '[:space:]')"
+[ "${send_checks}" = "true" ] || fail "send/read round-trip field assertions failed (got '${send_checks}')"
+ok "send_gcloud_logs round-trip preserves service identity, severity, body, trace/span, flags, and labels"
 
 log "Sample row:"
 printf '%s\n' "${assert_out}" | sed -n '/---SAMPLE---/,/---RESOURCEATTRS---/p' | sed '1d;$d'

@@ -21,6 +21,11 @@ SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_gcloud_
 ----
 true
 
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'send_gcloud_logs';
+----
+true
+
 # The custom secret type works with Application Default Credentials (no token, no key file).
 statement ok
 CREATE SECRET gcloud_adc (
@@ -50,6 +55,32 @@ CREATE SECRET gcloud_key (
     QUOTA_PROJECT 'billing-project'
 );
 
+# An explicitly selected service-account file supplies its own project_id; sender binding must not
+# borrow the unrelated process ADC project.
+statement ok
+CREATE SECRET gcloud_key_inferred_project (
+    TYPE gcloud,
+    CREDENTIALS '{WORKING_DIR}/test/fixtures/gcloud_service_account_minimal.json'
+);
+
+query I
+SELECT column_type = 'VARCHAR'
+FROM (DESCRIBE SELECT send_gcloud_logs({'body': 'hi'}, 'gcloud_key_inferred_project'));
+----
+true
+
+# A static token carries no trustworthy destination project and must never borrow process ADC.
+statement ok
+CREATE SECRET gcloud_token_without_project (
+    TYPE gcloud,
+    TOKEN 'TOKEN_WITHOUT_PROJECT'
+);
+
+statement error
+DESCRIBE SELECT send_gcloud_logs({'body': 'hi'}, 'gcloud_token_without_project');
+----
+with TOKEN must also set PROJECT
+
 # TOKEN is redacted, never shown in duckdb_secrets().
 query I
 SELECT secret_string NOT LIKE '%SECRET_TOKEN_VALUE%' FROM duckdb_secrets() WHERE name = 'gcloud_token';
@@ -61,6 +92,49 @@ query I
 SELECT secret_string LIKE '%/path/to/service-account.json%' FROM duckdb_secrets() WHERE name = 'gcloud_key';
 ----
 true
+
+# The sender mirrors the Datadog scalar contract: an OTLP-shaped row STRUCT, optional constant
+# secret name, VARCHAR result, and unknown fields ignored. Binding never mints a token or writes.
+query I
+SELECT column_type = 'VARCHAR'
+FROM (DESCRIBE SELECT send_gcloud_logs({'body': 'hi', 'service_name': 'checkout', 'unknown_extra': 1},
+                                      'gcloud_adc'));
+----
+true
+
+# A NULL struct is NULL/no-op, so this execution remains fully offline.
+query I
+SELECT send_gcloud_logs(NULL::STRUCT(body VARCHAR), 'gcloud_adc') IS NULL;
+----
+true
+
+# Non-empty attribute values are caller data: malformed JSON and non-object JSON fail before any
+# request rather than returning ok after silently dropping them.
+statement error
+SELECT send_gcloud_logs({'body': 'hi', 'resource_attributes': 'not-json'}, 'gcloud_token');
+----
+resource_attributes must be a valid JSON object
+
+statement error
+SELECT send_gcloud_logs({'body': 'hi', 'log_attributes': '[]'}, 'gcloud_token');
+----
+log_attributes must be a valid JSON object
+
+statement error
+DESCRIBE SELECT send_gcloud_logs('not a struct', 'gcloud_adc');
+----
+first argument must be a STRUCT
+
+statement error
+DESCRIBE SELECT send_gcloud_logs({'body': 'hi'}, 'no_such_secret');
+----
+No secret with name 'no_such_secret' found
+
+statement error
+DESCRIBE SELECT send_gcloud_logs({'body': 'hi'}, secret_name)
+FROM (VALUES ('gcloud_adc')) secrets(secret_name);
+----
+secret name must be a constant string
 
 # Referencing a secret that does not exist fails at bind time.
 statement error

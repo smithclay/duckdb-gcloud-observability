@@ -46,6 +46,7 @@ set(EXTENSION_SOURCES
     src/gcloud_json.cpp
     src/gcloud_topology.cpp
     src/logs_table.cpp
+    src/send_logs.cpp
     src/alerts_table.cpp
     src/service_dependencies_table.cpp
     src/gcloud_catalog.cpp)
@@ -68,14 +69,24 @@ endforeach()
 # Offline C++ test for the pure request-building and response-parsing helpers. Deliberately a C++
 # test rather than test-only SQL functions, keeping internals out of the extension's SQL surface.
 if(NOT EMSCRIPTEN)
-  add_executable(gcloud_json_test EXCLUDE_FROM_ALL test/cpp/gcloud_json_test.cpp src/gcloud_json.cpp
-                                                         src/gcloud_topology.cpp)
+  add_executable(
+    gcloud_json_test EXCLUDE_FROM_ALL
+    test/cpp/gcloud_json_test.cpp
+    src/gcloud_json.cpp
+    src/gcloud_topology.cpp
+    src/send_logs.cpp
+    src/gcloud_client.cpp
+    src/gcloud_auth.cpp
+    src/gcloud_secret.cpp)
   target_include_directories(
     gcloud_json_test PRIVATE src/include
+                             "${GCLOUD_DUCKDB_DIR}/third_party/httplib"
                              "${GCLOUD_DUCKDB_DIR}/third_party/yyjson/include")
+  target_compile_definitions(gcloud_json_test PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
   # Keep DuckDB before the dummy extension loader: GNU ld resolves static
   # archives left-to-right, and duckdb_static introduces loader references.
-  target_link_libraries(gcloud_json_test duckdb_static dummy_static_extension_loader)
+  target_link_libraries(gcloud_json_test duckdb_static dummy_static_extension_loader OpenSSL::SSL OpenSSL::Crypto
+                                         CURL::libcurl)
   set_target_properties(
     gcloud_json_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                 "${CMAKE_BINARY_DIR}/extension/gcloud_observability")

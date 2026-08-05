@@ -60,6 +60,11 @@ struct GcloudClient {
 	//! POST `json_body` to /v2/entries:list. Convenience wrapper over Request.
 	string ListEntries(ClientContext &context, const string &json_body) const;
 
+	//! POST one pre-batched request to /v2/entries:write. Unlike the read request path, ambiguous
+	//! transport failures are not retried because the server may already have accepted the batch.
+	//! A server-generated 429 is retried; 5xx responses are treated as ambiguous and are not replayed.
+	string WriteEntries(ClientContext &context, const string &json_body) const;
+
 	//! GET `path` (which must already carry any query string). Convenience wrapper over Request.
 	string Get(ClientContext &context, const string &path, const char *api_name) const;
 

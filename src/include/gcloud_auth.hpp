@@ -9,6 +9,10 @@ class ClientContext;
 //! googlecloudmonitoringreceiver, which calls google.FindDefaultCredentials(ctx, <read scope>).
 extern const char *const kLoggingReadScope;
 
+//! OAuth2 scope requested by entries.write. Kept separate from the read scope so a service-account
+//! token used only for queries is never granted write authority.
+extern const char *const kLoggingWriteScope;
+
 //! OAuth2 scope for the Cloud Monitoring read path, used by the alerts tables. Requested separately
 //! from the logging scope so a logs-only query never asks for monitoring authority (and vice
 //! versa); the token cache is keyed by scope, so the two coexist.
@@ -64,6 +68,11 @@ string DiscoverAdcPath();
 //! for a service-account key, its `project_id`. Returns an empty string if nothing can be read —
 //! never throws, since this only supplies a default the user may override.
 string TryDiscoverAdcProject();
+
+//! Best-effort project inferred from an explicitly selected service-account credentials file.
+//! Returns its `project_id` only when the file is readable JSON with `type=service_account`; user
+//! credential quota projects are deliberately not treated as write destinations.
+string TryDiscoverServiceAccountProject(const string &credentials_file);
 
 //! Mint (or return a cached) OAuth2 access token for `config`.
 //!
