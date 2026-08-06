@@ -5,6 +5,7 @@
 #include "gcloud_catalog.hpp"
 #include "gcloud_secret.hpp"
 #include "logs_table.hpp"
+#include "metrics_table.hpp"
 #include "send_logs.hpp"
 #include "service_dependencies_table.hpp"
 
@@ -21,6 +22,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Catalog: ATTACH 'gcloud:' AS gcp (TYPE gcloud, PROJECT '...').
 	RegisterGcloudCatalog(loader);
 	RegisterGcloudLogsFunction(loader);
+	RegisterGcloudMetricsFunction(loader);
 	// Sender: SELECT send_gcloud_logs(l) FROM logs l.
 	RegisterGcloudSendLogsFunction(loader);
 	// App Topology: SELECT * FROM read_gcloud_service_dependencies(project => '...').
