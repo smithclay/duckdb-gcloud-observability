@@ -46,6 +46,7 @@ set(EXTENSION_SOURCES
     src/gcloud_json.cpp
     src/gcloud_topology.cpp
     src/logs_table.cpp
+	 src/metrics_table.cpp
     src/send_logs.cpp
     src/alerts_table.cpp
     src/service_dependencies_table.cpp
