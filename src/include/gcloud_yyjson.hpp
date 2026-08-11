@@ -132,6 +132,37 @@ inline bool GcloudGetInt64Flexible(duckdb_yyjson::yyjson_val *obj, const char *k
 	return false;
 }
 
+//! Read a JSON number as a double whatever subtype it parsed as.
+//!
+//! proto3 JSON prints a whole double without a fractional part, so Cloud Monitoring returns
+//! `"doubleValue":2` for 2.0 and yyjson parses that with an *integer* subtype. `yyjson_get_real`
+//! returns 0.0 for anything that is not YYJSON_SUBTYPE_REAL, which silently turns every integral
+//! gauge into a zero; `yyjson_get_num` reads uint, sint, and real alike. A numeric string is
+//! accepted too, matching GcloudGetInt64Flexible's tolerance for the int64-as-string mapping.
+inline bool GcloudGetDoubleFlexible(duckdb_yyjson::yyjson_val *obj, const char *key, double &out) {
+	if (!obj) {
+		return false;
+	}
+	auto *v = duckdb_yyjson::yyjson_obj_get(obj, key);
+	if (!v) {
+		return false;
+	}
+	if (duckdb_yyjson::yyjson_is_num(v)) {
+		out = duckdb_yyjson::yyjson_get_num(v);
+		return true;
+	}
+	if (duckdb_yyjson::yyjson_is_str(v)) {
+		const char *str = duckdb_yyjson::yyjson_get_str(v);
+		char *end = nullptr;
+		double parsed = std::strtod(str, &end);
+		if (end && end != str && *end == '\0') {
+			out = parsed;
+			return true;
+		}
+	}
+	return false;
+}
+
 inline bool GcloudGetBool(duckdb_yyjson::yyjson_val *obj, const char *key, bool &out) {
 	if (!obj) {
 		return false;
