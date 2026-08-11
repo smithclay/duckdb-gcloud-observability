@@ -61,6 +61,23 @@ string FormatRfc3339(int64_t epoch_seconds) {
 	return StringUtil::Format("%04d-%02d-%02dT%02d:%02d:%02dZ", year, month, day, hour, minute, second);
 }
 
+string FormatRfc3339Nanos(int64_t epoch_nanos) {
+	auto seconds = epoch_nanos / 1000000000;
+	auto fraction = epoch_nanos % 1000000000;
+	// C++ truncates division toward zero, so a pre-epoch instant lands one second late with a
+	// negative remainder. Borrow a second to bring the fraction back into [0, 1e9).
+	if (fraction < 0) {
+		fraction += 1000000000;
+		seconds--;
+	}
+	auto base = FormatRfc3339(seconds);
+	if (fraction == 0) {
+		return base;
+	}
+	base.pop_back(); // the 'Z', re-appended after the fractional digits
+	return base + StringUtil::Format(".%09lldZ", static_cast<long long>(fraction));
+}
+
 string ResolveTimeSpec(const string &parameter, const string &spec) {
 	string trimmed = spec;
 	StringUtil::Trim(trimmed);

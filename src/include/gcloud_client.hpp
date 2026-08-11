@@ -65,6 +65,13 @@ struct GcloudClient {
 	//! A server-generated 429 is retried; 5xx responses are treated as ambiguous and are not replayed.
 	string WriteEntries(ClientContext &context, const string &json_body) const;
 
+	//! POST one pre-batched request to Cloud Monitoring's timeSeries.create (`path` must already
+	//! name the project). Shares WriteEntries' write semantics: a request that may already have been
+	//! applied is never replayed. Unlike entries.write there is no all-or-nothing switch to ask for
+	//! — timeSeries.create has no `partialSuccess` counterpart — so a rejected batch may still have
+	//! stored some of its points.
+	string WriteTimeSeries(ClientContext &context, const string &path, const string &json_body) const;
+
 	//! GET `path` (which must already carry any query string). Convenience wrapper over Request.
 	string Get(ClientContext &context, const string &path, const char *api_name) const;
 
@@ -74,6 +81,13 @@ struct GcloudClient {
 	string GrpcUnary(ClientContext &context, const string &method, const string &protobuf, const char *api_name) const;
 
 private:
+	//! Shared implementation of the write calls: POST that never replays a request which may already
+	//! have been applied. `api_label` names the operation in error messages ("Cloud Logging
+	//! entries.write"). Kept separate from Request so the two retry policies cannot drift into each
+	//! other — reads ride out 5xx and ambiguous transport failures, writes must not.
+	string PostWithoutReplay(ClientContext &context, const string &path, const string &json_body,
+	                         const char *api_label) const;
+
 #ifndef __EMSCRIPTEN__
 	//! Lazily created on first use and reused (HTTP keep-alive). Mutable because ListEntries is
 	//! const — it runs against the const bind data shared by all scans — yet must cache the socket.

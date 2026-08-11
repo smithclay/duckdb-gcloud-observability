@@ -2,6 +2,7 @@
 #include "gcloud_json.hpp"
 #include "gcloud_topology.hpp"
 #include "send_logs.hpp"
+#include "send_metrics.hpp"
 
 #include "duckdb/common/exception.hpp"
 
@@ -289,6 +290,112 @@ int main() {
 			non_object_attributes_rejected = true;
 		}
 		Require(non_object_attributes_rejected, "non-object resource_attributes must not be silently dropped");
+
+		//===------------------------------------------------------------===//
+		// timeSeries.create request (send_gcloud_metrics)
+		//===------------------------------------------------------------===//
+		Require(NormalizeGcloudMetricType("http.server.request.count") ==
+		            "custom.googleapis.com/http.server.request.count",
+		        "an unqualified name should become a user-defined metric type");
+		Require(NormalizeGcloudMetricType("workload.googleapis.com/requests") == "workload.googleapis.com/requests",
+		        "a name already under a Google metric domain should be left alone");
+		Require(NormalizeGcloudMetricType(" obsbench/errors ") == "custom.googleapis.com/obsbench/errors",
+		        "surrounding whitespace should not become part of the metric type");
+		auto rejects_metric_type = [](const string &name) {
+			try {
+				NormalizeGcloudMetricType(name);
+			} catch (const InvalidInputException &) {
+				return true;
+			}
+			return false;
+		};
+		Require(rejects_metric_type("requests/second!"), "an illegal character must be reported, not rewritten");
+		Require(rejects_metric_type("obsbench//errors"), "an empty path element must be rejected");
+		Require(rejects_metric_type("obsbench/_errors"), "a path element must start with a letter or digit");
+		Require(rejects_metric_type(string(250, 'a')), "a metric type longer than 200 bytes must be rejected");
+		Require(rejects_metric_type(""), "a nameless point must be rejected");
+
+		Require(NormalizeGcloudMetricLabelKey("gcp.label.Team") == "team",
+		        "a gcp.label. prefix should be stripped and the key lower-cased, as in send_gcloud_logs");
+		Require(NormalizeGcloudMetricLabelKey("service.name") == "service.name",
+		        "a dotted semconv key is already a legal Cloud Monitoring label key");
+		auto rejects_label_key = [](const string &key) {
+			try {
+				NormalizeGcloudMetricLabelKey(key);
+			} catch (const InvalidInputException &) {
+				return true;
+			}
+			return false;
+		};
+		Require(rejects_label_key("9lives"), "a label key must start with a letter");
+		Require(rejects_label_key("http-method"), "a label key may not hold a hyphen");
+		Require(rejects_label_key(""), "an empty label key must be rejected");
+
+		GcloudWriteMetric gauge;
+		gauge.project = "my-project";
+		gauge.metric_type = NormalizeGcloudMetricType("obsbench/http.server.request.count");
+		gauge.description = "Requests in the interval";
+		gauge.unit = "{request}";
+		gauge.double_value = 42.5;
+		gauge.end_time_nanos = 123456789;
+		// A rollup bucket's start: meaningful to the caller, but not a claim Cloud Monitoring lets a
+		// GAUGE make, so it must not reach the request.
+		gauge.has_start_time_nanos = true;
+		gauge.start_time_nanos = 100000000;
+		gauge.resource_type = "generic_task";
+		gauge.resource_labels.emplace_back("job", "checkout");
+		gauge.resource_labels.emplace_back("project_id", "my-project");
+		gauge.metric_labels.emplace_back("service.name", "checkout");
+		auto gauge_body = BuildGcloudTimeSeriesBody({gauge});
+		Require(gauge_body.find(R"("type":"custom.googleapis.com/obsbench/http.server.request.count")") != string::npos,
+		        "the qualified metric type should identify the series");
+		Require(gauge_body.find(R"("service.name":"checkout")") != string::npos &&
+		            gauge_body.find(R"("job":"checkout")") != string::npos &&
+		            gauge_body.find(R"("project_id":"my-project")") != string::npos,
+		        "metric and monitored-resource labels should both be written");
+		Require(gauge_body.find(R"("metricKind":"GAUGE")") != string::npos &&
+		            gauge_body.find(R"("valueType":"DOUBLE")") != string::npos &&
+		            gauge_body.find(R"("unit":"{request}")") != string::npos &&
+		            gauge_body.find(R"("description":"Requests in the interval")") != string::npos,
+		        "descriptor-shaping fields should accompany the point");
+		Require(gauge_body.find(R"("endTime":"1970-01-01T00:00:00.123456789Z")") != string::npos,
+		        "the point's end time should keep nanosecond precision");
+		Require(gauge_body.find("startTime") == string::npos,
+		        "a GAUGE interval must not carry a start time that differs from its end time");
+		Require(gauge_body.find(R"("doubleValue":42.5)") != string::npos,
+		        "a double point should be written as a number");
+
+		GcloudWriteMetric counter;
+		counter.project = "my-project";
+		counter.metric_type = NormalizeGcloudMetricType("obsbench/errors");
+		counter.metric_kind = "CUMULATIVE";
+		counter.is_integer = true;
+		counter.integer_value = 7;
+		counter.end_time_nanos = 2000000000;
+		counter.has_start_time_nanos = true;
+		counter.start_time_nanos = 1000000000;
+		counter.resource_type = "global";
+		auto counter_body = BuildGcloudTimeSeriesBody({counter});
+		Require(counter_body.find(R"("startTime":"1970-01-01T00:00:01Z")") != string::npos &&
+		            counter_body.find(R"("endTime":"1970-01-01T00:00:02Z")") != string::npos,
+		        "a CUMULATIVE point should carry the interval it accumulated over");
+		Require(counter_body.find(R"("int64Value":"7")") != string::npos,
+		        "proto3 JSON encodes int64 as a string, which is also how the reader parses it");
+
+		// Series identity is what the batcher uses to keep one series out of a request twice, so it
+		// must follow the labels rather than just the metric type.
+		auto other_service = gauge;
+		other_service.metric_labels[0].second = "payment";
+		Require(GcloudMetricSeriesKey(gauge) != GcloudMetricSeriesKey(other_service),
+		        "two services' points are different series");
+		auto later_point = gauge;
+		later_point.end_time_nanos = 999999999;
+		Require(GcloudMetricSeriesKey(gauge) == GcloudMetricSeriesKey(later_point),
+		        "two points of one series must share a key regardless of their timestamps");
+		auto other_resource = gauge;
+		other_resource.resource_labels[0].second = "payment";
+		Require(GcloudMetricSeriesKey(gauge) != GcloudMetricSeriesKey(other_resource),
+		        "the monitored resource is part of the series identity");
 
 		//===------------------------------------------------------------===//
 		// Row budget

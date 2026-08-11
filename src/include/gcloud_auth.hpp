@@ -18,6 +18,11 @@ extern const char *const kLoggingWriteScope;
 //! versa); the token cache is keyed by scope, so the two coexist.
 extern const char *const kMonitoringReadScope;
 
+//! OAuth2 scope requested by timeSeries.create. Separate from the monitoring read scope for the
+//! same reason entries.write is separate from the logging read scope: a token minted for queries
+//! must not carry authority to write metrics.
+extern const char *const kMonitoringWriteScope;
+
 //! App Topology's generated topology method accepts the general Cloud Platform scope.
 extern const char *const kCloudPlatformScope;
 

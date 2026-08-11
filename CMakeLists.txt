@@ -48,6 +48,7 @@ set(EXTENSION_SOURCES
     src/logs_table.cpp
 	 src/metrics_table.cpp
     src/send_logs.cpp
+    src/send_metrics.cpp
     src/alerts_table.cpp
     src/service_dependencies_table.cpp
     src/gcloud_catalog.cpp)
@@ -76,6 +77,7 @@ if(NOT EMSCRIPTEN)
     src/gcloud_json.cpp
     src/gcloud_topology.cpp
     src/send_logs.cpp
+    src/send_metrics.cpp
     src/gcloud_client.cpp
     src/gcloud_auth.cpp
     src/gcloud_secret.cpp)

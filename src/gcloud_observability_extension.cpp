@@ -7,6 +7,7 @@
 #include "logs_table.hpp"
 #include "metrics_table.hpp"
 #include "send_logs.hpp"
+#include "send_metrics.hpp"
 #include "service_dependencies_table.hpp"
 
 #include "duckdb.hpp"
@@ -23,8 +24,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterGcloudCatalog(loader);
 	RegisterGcloudLogsFunction(loader);
 	RegisterGcloudMetricsFunction(loader);
-	// Sender: SELECT send_gcloud_logs(l) FROM logs l.
+	// Senders: SELECT send_gcloud_logs(l) FROM logs l, SELECT send_gcloud_metrics(m) FROM metrics m.
 	RegisterGcloudSendLogsFunction(loader);
+	RegisterGcloudSendMetricsFunction(loader);
 	// App Topology: SELECT * FROM read_gcloud_service_dependencies(project => '...').
 	RegisterGcloudServiceDependenciesFunction(loader);
 }

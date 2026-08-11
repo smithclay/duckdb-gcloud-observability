@@ -556,9 +556,18 @@ string GcloudClient::ListEntries(ClientContext &context, const string &json_body
 }
 
 string GcloudClient::WriteEntries(ClientContext &context, const string &json_body) const {
+	return PostWithoutReplay(context, kEntriesWritePath, json_body, "Cloud Logging entries.write");
+}
+
+string GcloudClient::WriteTimeSeries(ClientContext &context, const string &path, const string &json_body) const {
+	return PostWithoutReplay(context, path, json_body, "Cloud Monitoring timeSeries.create");
+}
+
+string GcloudClient::PostWithoutReplay(ClientContext &context, const string &path, const string &json_body,
+                                       const char *api_label) const {
 	string origin, path_prefix;
 	SplitGcloudEndpoint(endpoint, origin, path_prefix);
-	auto full_path = path_prefix + kEntriesWritePath;
+	auto full_path = path_prefix + path;
 
 #ifdef __EMSCRIPTEN__
 	if (context.interrupted) {
@@ -588,18 +597,18 @@ string GcloudClient::WriteEntries(ClientContext &context, const string &json_bod
 	request.try_request = true;
 	auto response = http_util.Request(request);
 	if (!response) {
-		throw IOException("Cloud Logging entries.write request to %s failed: no response (the batch might have been "
+		throw IOException("%s request to %s failed: no response (the batch might have been "
 		                  "accepted; it was not retried)",
-		                  url);
+		                  api_label, url);
 	}
 	if (!response->Success()) {
 		if (response->status != HTTPStatusCode::INVALID) {
-			throw IOException("Cloud Logging entries.write returned HTTP %d: %s",
-			                  static_cast<uint16_t>(response->status), DescribeApiError(response->body));
+			throw IOException("%s returned HTTP %d: %s", api_label, static_cast<uint16_t>(response->status),
+			                  DescribeApiError(response->body));
 		}
-		throw IOException("Cloud Logging entries.write request to %s failed: %s (the batch might have been accepted; "
+		throw IOException("%s request to %s failed: %s (the batch might have been accepted; "
 		                  "it was not retried)",
-		                  url, response->GetError());
+		                  api_label, url, response->GetError());
 	}
 	return response->body;
 #else
@@ -626,8 +635,7 @@ string GcloudClient::WriteEntries(ClientContext &context, const string &json_bod
 				continue;
 			}
 			throw IOException(
-			    "Cloud Logging entries.write request to %s failed: %s%s", endpoint,
-			    duckdb_httplib_openssl::to_string(error),
+			    "%s request to %s failed: %s%s", api_label, endpoint, duckdb_httplib_openssl::to_string(error),
 			    IsPreSendTransportError(error) ? "" : " (the batch might have been accepted; it was not retried)");
 		}
 		if (response->status == 401 && !token_refreshed) {
@@ -636,15 +644,15 @@ string GcloudClient::WriteEntries(ClientContext &context, const string &json_bod
 			continue;
 		}
 		// A 429 is an explicit rejection and safe to replay. Do not retry 5xx responses: Google does
-		// not guarantee that a write was uncommitted before that response, and insertId is not a full
-		// storage/export idempotency guarantee.
+		// not guarantee that a write was uncommitted before that response, and neither entries.write's
+		// insertId nor a time series' (series, end time) identity is a full storage/export idempotency
+		// guarantee.
 		if (response->status == 429 && attempt < retries) {
 			SleepCheckingInterrupt(context, RateLimitRetryDelaySeconds(*response, attempt));
 			continue;
 		}
 		if (response->status < 200 || response->status >= 300) {
-			throw IOException("Cloud Logging entries.write returned HTTP %d: %s", response->status,
-			                  DescribeApiError(response->body));
+			throw IOException("%s returned HTTP %d: %s", api_label, response->status, DescribeApiError(response->body));
 		}
 		return response->body;
 	}

@@ -21,6 +21,12 @@ bool ParseRfc3339ToNanos(const char *str, int64_t &out_nanos);
 //! accepts in a `timestamp` comparison.
 string FormatRfc3339(int64_t epoch_seconds);
 
+//! Format epoch nanoseconds as an RFC 3339 UTC timestamp, keeping the sub-second part when there is
+//! one. Both write paths need it and neither may truncate to whole seconds: Cloud Logging preserves
+//! a LogEntry timestamp to the nanosecond, and Cloud Monitoring requires consecutive points in one
+//! time series to be at least five seconds apart, which is a judgment about the exact end times.
+string FormatRfc3339Nanos(int64_t epoch_nanos);
+
 //! Interpret a `start_time`/`end_time` argument. Accepts `now`, a relative offset (`-15m`, `-2h`,
 //! `-7d`, `-30s`) resolved against the current time, or an RFC 3339 instant passed through as-is.
 //! Throws InvalidInputException on anything else, naming `parameter` in the message.
