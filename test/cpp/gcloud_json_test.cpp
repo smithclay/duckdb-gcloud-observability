@@ -1,6 +1,7 @@
 #include "gcloud_auth.hpp"
 #include "gcloud_json.hpp"
 #include "gcloud_topology.hpp"
+#include "gcloud_yyjson.hpp"
 #include "send_logs.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -289,6 +290,33 @@ int main() {
 			non_object_attributes_rejected = true;
 		}
 		Require(non_object_attributes_rejected, "non-object resource_attributes must not be silently dropped");
+
+		//===------------------------------------------------------------===//
+		// Numeric subtypes (proto3 JSON)
+		//===------------------------------------------------------------===//
+		// A whole double prints without a fractional part, so Cloud Monitoring sends
+		// `"doubleValue":2` for 2.0 and yyjson parses it with an integer subtype. Reading that
+		// with yyjson_get_real yields 0.0, which turned every integral gauge into a zero while
+		// the point count still looked right -- a real project reported data that summed to
+		// nothing. Nothing else in the metrics response is parsed outside its table function, so
+		// this accessor is the seam that makes the failure reproducible offline.
+		string point_json = R"({"whole":2,"fractional":2.5,"large":1234567890,)"
+		                    R"("stringy":"3.5","text":"NaNsense"})";
+		YyjsonDocPtr point_doc(duckdb_yyjson::yyjson_read(point_json.c_str(), point_json.size(), 0));
+		auto *point_value = duckdb_yyjson::yyjson_doc_get_root(point_doc.get());
+		double number = -1;
+		Require(GcloudGetDoubleFlexible(point_value, "whole", number) && number == 2.0,
+		        "an integer-subtyped JSON number is still a double value");
+		Require(GcloudGetDoubleFlexible(point_value, "fractional", number) && number == 2.5,
+		        "a real-subtyped JSON number reads unchanged");
+		Require(GcloudGetDoubleFlexible(point_value, "large", number) && number == 1234567890.0,
+		        "a large whole number keeps its magnitude");
+		Require(GcloudGetDoubleFlexible(point_value, "stringy", number) && number == 3.5,
+		        "a numeric string is accepted, as in the int64-as-string mapping");
+		Require(!GcloudGetDoubleFlexible(point_value, "text", number), "a non-numeric string is not a number");
+		Require(!GcloudGetDoubleFlexible(point_value, "absent", number),
+		        "a missing key is reported rather than defaulted to zero");
+		Require(!GcloudGetDoubleFlexible(nullptr, "whole", number), "a null object yields nothing");
 
 		//===------------------------------------------------------------===//
 		// Row budget
