@@ -136,6 +136,91 @@ FROM (VALUES ('gcloud_adc')) secrets(secret_name);
 ----
 secret name must be a constant string
 
+# The metric sender follows the same contract. Its validation is stricter in one place: a metric
+# point has no defaultable field the way a log entry's timestamp and body do, so a row missing a
+# name, a value, or a timestamp is an error rather than a guess.
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'send_gcloud_metrics';
+----
+true
+
+query I
+SELECT column_type = 'VARCHAR'
+FROM (DESCRIBE SELECT send_gcloud_metrics({'name': 'requests', 'double_value': 1.0,
+                                           'time_unix_nano': TIMESTAMP_NS '2026-07-20 10:00:00',
+                                           'unknown_extra': 1}, 'gcloud_adc'));
+----
+true
+
+query I
+SELECT send_gcloud_metrics(NULL::STRUCT(name VARCHAR), 'gcloud_adc') IS NULL;
+----
+true
+
+statement error
+DESCRIBE SELECT send_gcloud_metrics({'double_value': 1.0}, 'gcloud_adc');
+----
+no metric name column
+
+statement error
+DESCRIBE SELECT send_gcloud_metrics('not a struct', 'gcloud_adc');
+----
+first argument must be a STRUCT
+
+statement error
+DESCRIBE SELECT send_gcloud_metrics({'name': 'requests'}, 'gcloud_token_without_project');
+----
+with TOKEN must also set PROJECT
+
+# Cloud Monitoring rejects a metric type holding characters outside its naming rules, so the sender
+# reports them instead of silently rewriting the name a caller will later query by.
+statement error
+SELECT send_gcloud_metrics({'name': 'requests!', 'double_value': 1.0,
+                            'time_unix_nano': TIMESTAMP_NS '2026-07-20 10:00:00'}, 'gcloud_token');
+----
+contains a character Cloud Monitoring does not allow
+
+# A label key is normalized (gcp.label. stripped, lower-cased) but never mangled: an unusable key is
+# an error, because a metric has no free-form payload to fall back on the way a log entry does.
+statement error
+SELECT send_gcloud_metrics({'name': 'requests', 'double_value': 1.0,
+                            'time_unix_nano': TIMESTAMP_NS '2026-07-20 10:00:00',
+                            'metric_attributes': '{"http-method":"GET"}'}, 'gcloud_token');
+----
+not a usable metric label key
+
+statement error
+SELECT send_gcloud_metrics({'name': 'requests', 'double_value': 1.0,
+                            'time_unix_nano': TIMESTAMP_NS '2026-07-20 10:00:00',
+                            'metric_attributes': 'not-json'}, 'gcloud_token');
+----
+metric_attributes must be a valid JSON object
+
+statement error
+SELECT send_gcloud_metrics({'name': 'requests', 'time_unix_nano': TIMESTAMP_NS '2026-07-20 10:00:00'},
+                           'gcloud_token');
+----
+has no value in this row
+
+statement error
+SELECT send_gcloud_metrics({'name': 'requests', 'double_value': 1.0}, 'gcloud_token');
+----
+has no timestamp in this row
+
+# A CUMULATIVE point's start time is the interval it accumulated over; without one the value has no
+# defined meaning, so it cannot be defaulted.
+statement error
+SELECT send_gcloud_metrics({'name': 'requests', 'double_value': 1.0, 'metric_kind': 'CUMULATIVE',
+                            'time_unix_nano': TIMESTAMP_NS '2026-07-20 10:00:00'}, 'gcloud_token');
+----
+needs a start time
+
+statement error
+SELECT send_gcloud_metrics({'name': 'requests', 'double_value': 1.0, 'metric_kind': 'HISTOGRAM',
+                            'time_unix_nano': TIMESTAMP_NS '2026-07-20 10:00:00'}, 'gcloud_token');
+----
+metric_kind must be GAUGE, CUMULATIVE, or DELTA
+
 # Referencing a secret that does not exist fails at bind time.
 statement error
 SELECT * FROM read_gcloud_logs(secret => 'no_such_secret', project => 'my-project');

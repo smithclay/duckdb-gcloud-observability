@@ -47,7 +47,8 @@ they expire.
 
 The principal needs `roles/logging.viewer` (or `logging.logEntries.list`) for log queries,
 `roles/logging.logWriter` (or `logging.logEntries.create`) for `send_gcloud_logs`,
-`roles/monitoring.viewer` for the alert tables, and
+`roles/monitoring.viewer` for the alert and metric tables,
+`roles/monitoring.metricWriter` (or `monitoring.timeSeries.create`) for `send_gcloud_metrics`, and
 [`roles/apptopology.viewer`][app-topology-iam] for service maps.
 
 ### Secrets
@@ -140,6 +141,63 @@ duplicates in query results, but does not guarantee de-duplication in exports.
 The sender uses the same `ENDPOINT`, TLS, quota-project, token refresh, timeout, retry, cancellation,
 and browser proxy behavior as the reader. Service-account tokens request `logging.write`; ADC user
 credentials retain the scopes granted by `gcloud auth application-default login`.
+
+## Sending metrics
+
+`send_gcloud_metrics` writes an OTLP-shaped metric row through Cloud Monitoring's
+[`timeSeries.create` API][timeseries-create]. It takes the same shape as the log sender — a whole
+row STRUCT, optionally followed by a constant gcloud secret name — and returns `ok` per accepted
+row, so a table written with it reads back through `read_gcloud_metrics`.
+
+```sql
+CREATE SECRET gcp_prod (TYPE gcloud, PROJECT 'my-project');
+
+SELECT send_gcloud_metrics(m, 'gcp_prod')
+FROM my_otlp_metrics m;
+```
+
+Recognized fields are `name` (or `metric_name` / `metric` / `metric_type`), `description`, `unit`,
+`metric_kind`, `double_value` / `int_value`, `time_unix_nano`, `start_time_unix_nano`,
+`service_name`, `service_namespace`, `service_instance_id`, `resource_type`, `resource_attributes`,
+and `metric_attributes`. Unknown columns are ignored.
+
+| Input | Cloud Monitoring `TimeSeries` |
+|---|---|
+| `name` | `metric.type`, qualified as `custom.googleapis.com/<name>` unless it already names a `*.googleapis.com` domain |
+| `time_unix_nano` | `points[0].interval.endTime` |
+| `start_time_unix_nano` | `points[0].interval.startTime`, for `CUMULATIVE` / `DELTA` only |
+| `double_value` / `int_value` | `points[0].value.doubleValue` / `.int64Value`, and `valueType` |
+| `metric_kind` | `metricKind`; `GAUGE` when absent |
+| `service_name`, `service_namespace`, `service_instance_id` | metric labels `service.name`, `service.namespace`, `service.instance.id` |
+| `metric_attributes.*` | metric labels (a `gcp.label.` prefix is stripped, keys are lower-cased) |
+| `resource_attributes.gcp.resource_type` | monitored-resource `type`, else `global` |
+| `resource_attributes.gcp.label.*` | monitored-resource labels, alongside `project_id` |
+| `description`, `unit` | carried on the series, which is what an auto-created descriptor takes them from |
+
+Writing a metric type that does not exist yet **creates a `MetricDescriptor`**, inferring its labels
+from the first write; a project holds a limited number of those, so scope a run with labels rather
+than by minting a metric type per run. Cloud Monitoring's own rules shape the rest:
+
+- A point's end time must be **no more than 25 hours in the past and no more than five minutes in
+  the future**, and consecutive points in one series must be **at least five seconds apart** and
+  written in ascending order — so `ORDER BY` the timestamp when backfilling.
+- One request carries at most **200 series with one point each**. The sender batches to that limit
+  and, because a request may not name a series twice, spreads repeated series across consecutive
+  requests rather than cutting a batch short — a table sorted by series costs no more requests than
+  one sorted by time.
+- Label keys must start with a letter and hold only lower-case letters, digits, underscores, and
+  dots. Keys are normalized to that form where possible; one that cannot be is an error, because a
+  `TimeSeries` has no free-form payload to fall back on the way a `LogEntry` does. The same applies
+  to a metric name outside the naming rules: it is reported rather than silently rewritten, so the
+  metric you query is the one you named.
+- Missing values cannot be defaulted the way a log entry's timestamp and body can. A row with no
+  name, no value, or no timestamp is rejected before anything is sent.
+
+Retry behavior matches the log sender: explicit 429s and failures known to have happened before any
+bytes were sent are retried, ambiguous ones are not. Note that `timeSeries.create` has no
+`partialSuccess` counterpart to entries.write's all-or-error switch, so a rejected batch may still
+have stored some of its points. Service-account tokens request `monitoring.write`, separately from
+the `monitoring.read` the alert and metric readers ask for.
 
 ## Service dependencies
 
@@ -268,6 +326,7 @@ a logs-only query never asks for monitoring authority.
 [policies]: https://cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.alertPolicies/list
 [alerts-list]: https://cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.alerts/list
 [entries-write]: https://cloud.google.com/logging/docs/reference/v2/rest/v2/entries/write
+[timeseries-create]: https://cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.timeSeries/create
 
 ## Mapping to OTLP
 

@@ -461,21 +461,6 @@ static string EncodeLogId(const string &input) {
 	return result;
 }
 
-static string FormatTimestampNanos(int64_t nanos) {
-	auto seconds = nanos / 1000000000;
-	auto fraction = nanos % 1000000000;
-	if (fraction < 0) {
-		fraction += 1000000000;
-		seconds--;
-	}
-	auto base = FormatRfc3339(seconds);
-	if (fraction == 0) {
-		return base;
-	}
-	base.pop_back();
-	return base + StringUtil::Format(".%09lldZ", static_cast<long long>(fraction));
-}
-
 static void PutStringLabels(yyjson_mut_doc *doc, yyjson_mut_val *target, yyjson_val *attributes, const string &prefix) {
 	if (!attributes) {
 		return;
@@ -591,7 +576,7 @@ string BuildGcloudWriteBody(const GcloudWriteLog *logs, idx_t count) {
 		PutStringLabels(doc.get(), resource_labels, resource_attributes, "gcp.label.");
 
 		if (log.has_timestamp_nanos) {
-			auto timestamp = FormatTimestampNanos(log.timestamp_nanos);
+			auto timestamp = FormatRfc3339Nanos(log.timestamp_nanos);
 			GcloudPutStr(doc.get(), entry, "timestamp", timestamp.c_str());
 		}
 		GcloudPutStr(doc.get(), entry, "severity", log.severity.c_str());

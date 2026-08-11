@@ -88,7 +88,19 @@ Source files under `src/` (+ headers in `src/include/`):
 - `gcloud_client.cpp` — `GcloudClient`: one keep-alive httplib connection and a generic
   `Request(method, path, ...)` (GET and POST, so the Logging and Monitoring readers share one path),
   plus the retry loop (429/5xx/transport, exponential backoff, ~100ms-granular cancellation via
-  `context.interrupted`, and a single 401 token re-mint).
+  `context.interrupted`, and a single 401 token re-mint). The **write** calls (`WriteEntries`,
+  `WriteTimeSeries`) go through a separate `PostWithoutReplay` instead, because their retry policy
+  is deliberately narrower: only an explicit 429 and failures known to predate any sent bytes are
+  replayed. Keep the two apart — a write riding out a 5xx the way a read does can duplicate data.
+- `send_metrics.cpp` — `send_gcloud_metrics`, the Cloud Monitoring counterpart of `send_logs.cpp`.
+  Two things differ from the log sender and both come from API rules rather than taste. Labels are
+  resolved and sorted while the *chunk is mapped*, not while the request is built, because the
+  batcher needs the same series identity the request will carry (`GcloudMetricSeriesKey`):
+  timeSeries.create refuses two points for one series in a request, so each pass takes the earliest
+  pending point of every distinct series and defers the rest, which keeps a series' points ascending
+  across requests. And a metric name or label key outside Cloud Monitoring's naming rules is an
+  *error*, not something to rewrite: a `TimeSeries` has no free-form payload to absorb what does not
+  fit, and a silently renamed metric is one the caller cannot query by the name they wrote.
 - `logs_table.cpp` — the bulk. The LogEntry→OTLP mapping, the scan/pagination loop, and the
   conservative WHERE pushdown.
 - `gcloud_json.cpp` — *pure* request building and response parsing (no network, no catalog, no
